@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { DatabaseSync } from 'node:sqlite';
 import {
@@ -41,6 +42,20 @@ export class NotFoundError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'NotFoundError';
+  }
+}
+
+export class UnauthorizedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'UnauthorizedError';
+  }
+}
+
+export class ConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ConflictError';
   }
 }
 
@@ -237,6 +252,18 @@ db.exec(`
     fields_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS admin_auth (
+    id TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS admin_sessions (
+    token_hash TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
   );
 `);
 
@@ -838,3 +865,235 @@ export function replaceBranchInfoDatasetInDb(payload: {
 
   return getBranchInfoDatasetFromDb();
 }
+
+// ---------------------------------------------------------------------------
+// Admin Access Code Authentication & Short-Lived Sessions
+// ---------------------------------------------------------------------------
+const ADMIN_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes temporary authorization
+
+function hashAccessCodeScrypt(accessCode: string): string {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = crypto.scryptSync(accessCode, salt, 64).toString('hex');
+  return `${salt}:${derived}`;
+}
+
+function verifyAccessCodeScrypt(accessCode: string, storedHash: string): boolean {
+  const parts = storedHash.split(':');
+  if (parts.length !== 2) return false;
+  const [salt, expectedHex] = parts;
+  if (!salt || !expectedHex) return false;
+  const derived = crypto.scryptSync(accessCode, salt, 64);
+  const expectedBuf = Buffer.from(expectedHex, 'hex');
+  if (derived.length !== expectedBuf.length) return false;
+  return crypto.timingSafeEqual(derived, expectedBuf);
+}
+
+function verifyEnvAccessCodeConstantTime(inputCode: string, envCode: string): boolean {
+  const a = crypto.createHash('sha256').update(inputCode, 'utf8').digest();
+  const b = crypto.createHash('sha256').update(envCode, 'utf8').digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+function sha256Token(token: string): string {
+  return crypto.createHash('sha256').update(token, 'utf8').digest('hex');
+}
+
+function pruneExpiredSessions() {
+  const nowIso = new Date().toISOString();
+  db.prepare('DELETE FROM admin_sessions WHERE expires_at <= ?').run(nowIso);
+}
+
+function createAdminSession(): { token: string; expiresAt: string } {
+  pruneExpiredSessions();
+  const token = crypto.randomBytes(32).toString('hex');
+  const tokenHash = sha256Token(token);
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + ADMIN_SESSION_TTL_MS).toISOString();
+
+  db.prepare(
+    `INSERT INTO admin_sessions (token_hash, created_at, expires_at)
+     VALUES (?, ?, ?)`
+  ).run(tokenHash, now.toISOString(), expiresAt);
+
+  return { token, expiresAt };
+}
+
+function getEnvAdminAccessCode(): string {
+  return (process.env.ADMIN_ACCESS_CODE || '').trim();
+}
+
+export function getAdminAuthStatus(): { configured: boolean; managedByEnv: boolean } {
+  const envCode = getEnvAdminAccessCode();
+  if (envCode) {
+    return { configured: true, managedByEnv: true };
+  }
+  const row = db
+    .prepare('SELECT id FROM admin_auth WHERE id = ?')
+    .get('primary') as { id: string } | undefined;
+  return { configured: Boolean(row), managedByEnv: false };
+}
+
+export function setupInitialAdminAccessCode(rawCode: unknown): {
+  token: string;
+  expiresAt: string;
+} {
+  if (getEnvAdminAccessCode()) {
+    throw new ConflictError('Admin Access Code is already configured via environment secret.');
+  }
+
+  const code = typeof rawCode === 'string' ? rawCode.trim() : '';
+  if (code.length < 4 || code.length > 64) {
+    throw new ValidationError('Admin Access Code must be between 4 and 64 characters.', {
+      accessCode: 'Admin Access Code must be between 4 and 64 characters.',
+    });
+  }
+
+  const hash = hashAccessCodeScrypt(code);
+  const now = new Date().toISOString();
+
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const existing = db
+      .prepare('SELECT id FROM admin_auth WHERE id = ?')
+      .get('primary') as { id: string } | undefined;
+
+    if (existing) {
+      db.exec('ROLLBACK');
+      throw new ConflictError('Admin Access Code has already been configured.');
+    }
+
+    db.prepare(
+      `INSERT INTO admin_auth (id, password_hash, updated_at)
+       VALUES (?, ?, ?)`
+    ).run('primary', hash, now);
+
+    db.exec('COMMIT');
+  } catch (err) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      // ignore if already rolled back
+    }
+    throw err;
+  }
+
+  return createAdminSession();
+}
+
+export function verifyAdminAccessCodeAndCreateSession(rawCode: unknown): {
+  token: string;
+  expiresAt: string;
+} {
+  const code = typeof rawCode === 'string' ? rawCode.trim() : '';
+  if (!code) {
+    throw new UnauthorizedError('Access denied. Invalid Admin Access Code.');
+  }
+
+  const envCode = getEnvAdminAccessCode();
+  if (envCode) {
+    if (!verifyEnvAccessCodeConstantTime(code, envCode)) {
+      throw new UnauthorizedError('Access denied. Invalid Admin Access Code.');
+    }
+    return createAdminSession();
+  }
+
+  const row = db
+    .prepare('SELECT password_hash FROM admin_auth WHERE id = ?')
+    .get('primary') as { password_hash: string } | undefined;
+
+  if (!row) {
+    throw new ValidationError('Admin Access Code is not set up yet. Please configure one first.');
+  }
+
+  if (!verifyAccessCodeScrypt(code, row.password_hash)) {
+    throw new UnauthorizedError('Access denied. Invalid Admin Access Code.');
+  }
+
+  return createAdminSession();
+}
+
+export function validateAdminSessionToken(token: string | null | undefined): boolean {
+  if (!token || typeof token !== 'string') return false;
+  const trimmed = token.trim();
+  if (!trimmed) return false;
+
+  const { configured } = getAdminAuthStatus();
+  if (!configured) return false;
+
+  const tokenHash = sha256Token(trimmed);
+  const nowIso = new Date().toISOString();
+  const row = db
+    .prepare('SELECT token_hash FROM admin_sessions WHERE token_hash = ? AND expires_at > ?')
+    .get(tokenHash, nowIso) as { token_hash: string } | undefined;
+
+  return Boolean(row);
+}
+
+export function revokeAdminSessionToken(token: string | null | undefined): void {
+  if (!token || typeof token !== 'string') return;
+  const tokenHash = sha256Token(token.trim());
+  db.prepare('DELETE FROM admin_sessions WHERE token_hash = ?').run(tokenHash);
+}
+
+export function changeAdminAccessCode(
+  rawCurrentCode: unknown,
+  rawNewCode: unknown
+): { token: string; expiresAt: string } {
+  if (getEnvAdminAccessCode()) {
+    throw new ValidationError(
+      'Admin Access Code is managed by the server ADMIN_ACCESS_CODE environment secret.'
+    );
+  }
+
+  const currentCode = typeof rawCurrentCode === 'string' ? rawCurrentCode.trim() : '';
+  const newCode = typeof rawNewCode === 'string' ? rawNewCode.trim() : '';
+
+  if (!currentCode) {
+    throw new ValidationError('Current Admin Access Code is required.', {
+      currentCode: 'Current Admin Access Code is required.',
+    });
+  }
+  if (newCode.length < 4 || newCode.length > 64) {
+    throw new ValidationError('New Admin Access Code must be between 4 and 64 characters.', {
+      newCode: 'New Admin Access Code must be between 4 and 64 characters.',
+    });
+  }
+  if (currentCode === newCode) {
+    throw new ValidationError('New Admin Access Code must be different from the current code.', {
+      newCode: 'New Admin Access Code must be different from the current code.',
+    });
+  }
+
+  const row = db
+    .prepare('SELECT password_hash FROM admin_auth WHERE id = ?')
+    .get('primary') as { password_hash: string } | undefined;
+
+  if (!row) {
+    throw new ValidationError('Admin Access Code has not been configured yet.');
+  }
+
+  if (!verifyAccessCodeScrypt(currentCode, row.password_hash)) {
+    throw new UnauthorizedError('Access denied. Invalid Admin Access Code.');
+  }
+
+  const nextHash = hashAccessCodeScrypt(newCode);
+  const now = new Date().toISOString();
+
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.prepare('UPDATE admin_auth SET password_hash = ?, updated_at = ? WHERE id = ?').run(
+      nextHash,
+      now,
+      'primary'
+    );
+    // Invalidate all prior temporary sessions after access code change
+    db.prepare('DELETE FROM admin_sessions').run();
+    db.exec('COMMIT');
+  } catch (err) {
+    db.exec('ROLLBACK');
+    throw err;
+  }
+
+  return createAdminSession();
+}
+

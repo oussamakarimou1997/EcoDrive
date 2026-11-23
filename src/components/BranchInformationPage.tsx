@@ -27,6 +27,9 @@ import {
   Trash2,
   Loader2,
   Database,
+  Lock,
+  ShieldCheck,
+  KeyRound,
 } from 'lucide-react';
 import {
   BranchInfoDataset,
@@ -47,9 +50,12 @@ import {
   saveImportedBranchInfoDataset,
   updateBranchInfoRecord,
 } from '../services/branchInfoService';
+import { AdminAuthError } from '../services/adminAuthService';
+import { ToastVariant, useAdminAuth } from '../context/AdminAuthContext';
+import { OperationConfirmModal, OperationConfirmType } from './OperationConfirmModal';
 
 interface BranchInformationPageProps {
-  onShowToast?: (message: string) => void;
+  onShowToast?: (message: string, variant?: ToastVariant) => void;
 }
 
 export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
@@ -89,12 +95,51 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
   const [formGeneralError, setFormGeneralError] = useState<string | null>(null);
   const [isSubmittingForm, setIsSubmittingForm] = useState(false);
 
-  const [deletingRecord, setDeletingRecord] = useState<BranchInfoRecord | null>(null);
-  const [isDeleting, setIsDeleting] = useState(false);
+  // 7. Admin Auth + Two-Step Operation Confirmation State
+  const {
+    isAuthorized,
+    getValidToken,
+    requireAdminAuthorization,
+    openChangeCodeModal,
+    lockSession,
+    handleAuthFailure,
+  } = useAdminAuth();
 
-  const notify = (msg: string) => {
+  type PendingBranchConfirm =
+    | {
+        kind: 'add';
+        fields: Record<string, string>;
+        recordName: string;
+        details: string[];
+      }
+    | {
+        kind: 'update';
+        record: BranchInfoRecord;
+        fields: Record<string, string>;
+        recordName: string;
+        details: string[];
+      }
+    | {
+        kind: 'delete';
+        record: BranchInfoRecord;
+        recordName: string;
+        details: string[];
+      }
+    | {
+        kind: 'import';
+        preview: BranchInfoImportPreview;
+        recordName: string;
+        details: string[];
+      };
+
+  const [pendingConfirm, setPendingConfirm] = useState<PendingBranchConfirm | null>(null);
+  const [confirmError, setConfirmError] = useState<string | null>(null);
+  const [isExecutingConfirm, setIsExecutingConfirm] = useState(false);
+  const operationLockRef = useRef(false);
+
+  const notify = (msg: string, variant: ToastVariant = 'success') => {
     if (onShowToast) {
-      onShowToast(msg);
+      onShowToast(msg, variant);
     }
   };
 
@@ -242,7 +287,31 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
     return String(maxSn + 1);
   };
 
-  const openAddModal = () => {
+  const getBranchTitleFromFields = (fields: Record<string, string>, fallbackKey = ''): string => {
+    const col = cols.branchNameCol || dataset.columns[1] || dataset.columns[0];
+    const name = col ? (fields[col] || '').trim() : '';
+    return name || fallbackKey || 'Branch';
+  };
+
+  const getBranchDetailsList = (fields: Record<string, string>): string[] => {
+    const details: string[] = [];
+    if (cols.snCol && fields[cols.snCol]?.trim()) {
+      details.push(`S No. #${fields[cols.snCol].trim()}`);
+    }
+    if (cols.phoneCol && fields[cols.phoneCol]?.trim()) {
+      details.push(`Phone: ${fields[cols.phoneCol].trim()}`);
+    }
+    const loc =
+      (cols.locationCol && fields[cols.locationCol]?.trim()) ||
+      (cols.addressCol && fields[cols.addressCol]?.trim()) ||
+      '';
+    if (loc) {
+      details.push(loc);
+    }
+    return details;
+  };
+
+  const openAddModalNow = () => {
     const initial: Record<string, string> = {};
     dataset.columns.forEach((c) => {
       initial[c] = c === cols.snCol ? getNextSuggestedSn() : '';
@@ -254,7 +323,13 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
     setFormModalMode('add');
   };
 
-  const openEditModal = (record: BranchInfoRecord) => {
+  const requestOpenAddModal = () => {
+    requireAdminAuthorization('Add New Branch', () => {
+      openAddModalNow();
+    });
+  };
+
+  const openEditModalNow = (record: BranchInfoRecord) => {
     const initial: Record<string, string> = {};
     dataset.columns.forEach((c) => {
       initial[c] = record.fields[c] ?? '';
@@ -266,8 +341,28 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
     setFormModalMode('edit');
   };
 
+  const requestOpenEditModal = (record: BranchInfoRecord) => {
+    const title = getBranchTitle(record);
+    requireAdminAuthorization(`Edit Branch: ${title}`, () => {
+      openEditModalNow(record);
+    });
+  };
+
+  const requestDeleteRecord = (record: BranchInfoRecord) => {
+    const title = getBranchTitle(record);
+    requireAdminAuthorization(`Delete Branch: ${title}`, () => {
+      setConfirmError(null);
+      setPendingConfirm({
+        kind: 'delete',
+        record,
+        recordName: title,
+        details: getBranchDetailsList(record.fields),
+      });
+    });
+  };
+
   const closeFormModal = () => {
-    if (isSubmittingForm) return;
+    if (isSubmittingForm || isExecutingConfirm) return;
     setFormModalMode(null);
     setEditingRecord(null);
     setFormFieldErrors({});
@@ -354,8 +449,10 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
     return errs;
   };
 
-  const handleSubmitForm = async (e: React.FormEvent) => {
+  const handleSubmitForm = (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmittingForm || isExecutingConfirm || operationLockRef.current) return;
+
     const trimmed: Record<string, string> = {};
     dataset.columns.forEach((c) => {
       trimmed[c] = (formFields[c] ?? '').trim();
@@ -371,13 +468,43 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
       return;
     }
 
-    setIsSubmittingForm(true);
     setFormFieldErrors({});
     setFormGeneralError(null);
+    setConfirmError(null);
+
+    if (formModalMode === 'add') {
+      const recordName = getBranchTitleFromFields(trimmed);
+      setPendingConfirm({
+        kind: 'add',
+        fields: trimmed,
+        recordName,
+        details: getBranchDetailsList(trimmed),
+      });
+    } else if (formModalMode === 'edit' && editingRecord) {
+      const recordName = getBranchTitleFromFields(trimmed, editingRecord._rowKey);
+      setPendingConfirm({
+        kind: 'update',
+        record: editingRecord,
+        fields: trimmed,
+        recordName,
+        details: getBranchDetailsList(trimmed),
+      });
+    }
+  };
+
+  const runConfirmedMutation = async (action: PendingBranchConfirm, token: string) => {
+    if (operationLockRef.current) return;
+    operationLockRef.current = true;
+    setIsExecutingConfirm(true);
+    setIsSubmittingForm(action.kind === 'add' || action.kind === 'update');
+    if (action.kind === 'import') {
+      setIsSavingImport(true);
+    }
+    setConfirmError(null);
 
     try {
-      if (formModalMode === 'add') {
-        const created = await createBranchInfoRecord(trimmed);
+      if (action.kind === 'add') {
+        const created = await createBranchInfoRecord(action.fields, token);
         setDataset((prev) => {
           const nextRecords = [...prev.records, created];
           return {
@@ -390,10 +517,12 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
             ),
           };
         });
+        setPendingConfirm(null);
         setFormModalMode(null);
-        notify(`Added branch: ${getBranchTitle(created)}`);
-      } else if (formModalMode === 'edit' && editingRecord) {
-        const updated = await updateBranchInfoRecord(editingRecord._rowKey, trimmed);
+        setEditingRecord(null);
+        notify('Record added successfully!', 'success');
+      } else if (action.kind === 'update') {
+        const updated = await updateBranchInfoRecord(action.record._rowKey, action.fields, token);
         setDataset((prev) => {
           const nextRecords = prev.records.map((r) =>
             r._rowKey === updated._rowKey ? updated : r
@@ -411,50 +540,95 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
         if (selectedBranch?._rowKey === updated._rowKey) {
           setSelectedBranch(updated);
         }
+        setPendingConfirm(null);
         setFormModalMode(null);
         setEditingRecord(null);
-        notify(`Updated branch: ${getBranchTitle(updated)}`);
+        notify('Record updated successfully!', 'success');
+      } else if (action.kind === 'delete') {
+        await deleteBranchInfoRecord(action.record._rowKey, token);
+        setDataset((prev) => {
+          const nextRecords = prev.records.filter((r) => r._rowKey !== action.record._rowKey);
+          return {
+            ...prev,
+            records: nextRecords,
+            filterConfigs: buildBranchFilterConfigs(
+              prev.columns,
+              nextRecords,
+              prev.detectedColumns
+            ),
+          };
+        });
+        if (selectedBranch?._rowKey === action.record._rowKey) {
+          setSelectedBranch(null);
+        }
+        setPendingConfirm(null);
+        notify('Record deleted successfully!', 'success');
+      } else if (action.kind === 'import') {
+        const savedDataset = await saveImportedBranchInfoDataset(
+          {
+            fileName: action.preview.fileName,
+            sheetNames: action.preview.sheetNames,
+            columns: action.preview.columns,
+            detectedColumns: action.preview.detectedColumns,
+            records: action.preview.records,
+            notes: action.preview.notes,
+            importedAt: new Date().toLocaleTimeString([], {
+              hour: '2-digit',
+              minute: '2-digit',
+            }),
+          },
+          token
+        );
+
+        setDataset(savedDataset);
+        setSelectedBranch(null);
+        handleClearFilters();
+        setImportPreview(null);
+        setImportError(null);
+        setShowImportPanel(false);
+        setPendingConfirm(null);
+        notify('Record updated successfully!', 'success');
       }
     } catch (err) {
-      if (err instanceof BranchApiValidationError) {
-        setFormFieldErrors(err.fieldErrors);
-        setFormGeneralError(err.message);
+      if (err instanceof AdminAuthError) {
+        setPendingConfirm(null);
+        handleAuthFailure(`Re-authorize: ${action.recordName}`, () => {
+          setPendingConfirm(action);
+        });
+      } else if (err instanceof BranchApiValidationError) {
+        setPendingConfirm(null);
+        if (action.kind === 'add' || action.kind === 'update') {
+          setFormFieldErrors(err.fieldErrors);
+          setFormGeneralError(err.message);
+        } else if (action.kind === 'import') {
+          setImportError(err.message);
+        }
+        notify(err.message, 'error');
       } else {
-        setFormGeneralError(err instanceof Error ? err.message : 'Unable to save branch.');
+        const msg = err instanceof Error ? err.message : 'Operation failed. Please try again.';
+        setConfirmError(msg);
+        notify(msg, 'error');
       }
     } finally {
+      operationLockRef.current = false;
+      setIsExecutingConfirm(false);
       setIsSubmittingForm(false);
+      setIsSavingImport(false);
     }
   };
 
-  const handleConfirmDelete = async () => {
-    if (!deletingRecord) return;
-    setIsDeleting(true);
-    try {
-      await deleteBranchInfoRecord(deletingRecord._rowKey);
-      const deletedTitle = getBranchTitle(deletingRecord);
-      setDataset((prev) => {
-        const nextRecords = prev.records.filter((r) => r._rowKey !== deletingRecord._rowKey);
-        return {
-          ...prev,
-          records: nextRecords,
-          filterConfigs: buildBranchFilterConfigs(
-            prev.columns,
-            nextRecords,
-            prev.detectedColumns
-          ),
-        };
+  const handleConfirmOperation = async () => {
+    if (!pendingConfirm || operationLockRef.current) return;
+    const actionSnapshot = pendingConfirm;
+    const token = getValidToken();
+    if (!token) {
+      setPendingConfirm(null);
+      requireAdminAuthorization(`Authorize: ${actionSnapshot.recordName}`, () => {
+        setPendingConfirm(actionSnapshot);
       });
-      if (selectedBranch?._rowKey === deletingRecord._rowKey) {
-        setSelectedBranch(null);
-      }
-      setDeletingRecord(null);
-      notify(`Deleted branch: ${deletedTitle}`);
-    } catch (err) {
-      notify(err instanceof Error ? err.message : 'Failed to delete branch.');
-    } finally {
-      setIsDeleting(false);
+      return;
     }
+    await runConfirmedMutation(actionSnapshot, token);
   };
 
   // Excel Upload Handler
@@ -481,41 +655,21 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
     }
   };
 
-  const handleConfirmImport = async () => {
+  const requestImportConfirm = () => {
     if (!importPreview) return;
-    setIsSavingImport(true);
-    setImportError(null);
-
-    try {
-      const savedDataset = await saveImportedBranchInfoDataset({
-        fileName: importPreview.fileName,
-        sheetNames: importPreview.sheetNames,
-        columns: importPreview.columns,
-        detectedColumns: importPreview.detectedColumns,
-        records: importPreview.records,
-        notes: importPreview.notes,
-        importedAt: new Date().toLocaleTimeString([], {
-          hour: '2-digit',
-          minute: '2-digit',
-        }),
+    const previewSnapshot = importPreview;
+    requireAdminAuthorization(`Import Branch Dataset (${previewSnapshot.fileName})`, () => {
+      setConfirmError(null);
+      setPendingConfirm({
+        kind: 'import',
+        preview: previewSnapshot,
+        recordName: `${previewSnapshot.fileName} (${previewSnapshot.records.length} Branches)`,
+        details: [
+          `Worksheets: ${previewSnapshot.sheetNames.join(', ')}`,
+          `Replaces current branch directory`,
+        ],
       });
-
-      setDataset(savedDataset);
-      setSelectedBranch(null);
-      handleClearFilters();
-      setImportPreview(null);
-      setImportError(null);
-      setShowImportPanel(false);
-      notify(
-        `Saved ${savedDataset.records.length} branch records from ${savedDataset.fileName} to database`
-      );
-    } catch (err) {
-      setImportError(
-        err instanceof Error ? err.message : 'Failed to save imported branch records to database.'
-      );
-    } finally {
-      setIsSavingImport(false);
-    }
+    });
   };
 
   const isBranchFieldRequired = (col: string): boolean => {
@@ -693,79 +847,34 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
         </div>
       )}
 
-      {/* Delete Branch Confirmation Modal */}
-      {deletingRecord && (
-        <div
-          className="fixed inset-0 z-50 bg-slate-900/60 dark:bg-black/75 backdrop-blur-xs flex items-center justify-center p-4"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="delete-branch-title"
-        >
-          <div className="bg-white dark:bg-[#0F172A] rounded-2xl border border-[#E2E8F0] dark:border-slate-700 shadow-2xl max-w-md w-full overflow-hidden">
-            <div className="p-5 space-y-4">
-              <div className="flex items-start gap-3">
-                <div className="w-10 h-10 rounded-xl bg-rose-50 dark:bg-rose-950/60 border border-rose-200 dark:border-rose-800 text-rose-600 dark:text-rose-400 flex items-center justify-center shrink-0">
-                  <Trash2 className="w-5 h-5" />
-                </div>
-                <div>
-                  <h3
-                    id="delete-branch-title"
-                    className="text-base font-extrabold text-[#0F172A] dark:text-slate-100"
-                  >
-                    Confirm Delete Branch
-                  </h3>
-                  <p className="text-xs text-[#64748B] dark:text-slate-400 mt-1">
-                    Are you sure you want to permanently remove this branch from the database? This action cannot be undone.
-                  </p>
-                </div>
-              </div>
-
-              <div className="bg-[#F8FAFC] dark:bg-slate-900 border border-[#E2E8F0] dark:border-slate-800 rounded-xl p-3.5 text-xs space-y-1">
-                <div className="font-extrabold text-[#0F172A] dark:text-slate-100 text-sm">
-                  {getBranchTitle(deletingRecord)}
-                </div>
-                <div className="flex flex-wrap items-center gap-3 text-[#64748B] dark:text-slate-400">
-                  {getBranchSn(deletingRecord) && (
-                    <span className="font-mono">S No. #{getBranchSn(deletingRecord)}</span>
-                  )}
-                  {getBranchPhone(deletingRecord) && (
-                    <span className="font-mono">{getBranchPhone(deletingRecord)}</span>
-                  )}
-                </div>
-                {getBranchLocation(deletingRecord) && (
-                  <div className="text-[#64748B] dark:text-slate-400 pt-0.5">
-                    {getBranchLocation(deletingRecord)}
-                  </div>
-                )}
-              </div>
-            </div>
-
-            <div className="px-5 py-3.5 bg-[#F8FAFC] dark:bg-slate-900/80 border-t border-[#E2E8F0] dark:border-slate-800 flex items-center justify-end gap-2.5">
-              <button
-                type="button"
-                onClick={() => !isDeleting && setDeletingRecord(null)}
-                disabled={isDeleting}
-                className="px-4 py-2 rounded-xl bg-white dark:bg-slate-800 border border-[#CBD5E1] dark:border-slate-700 text-[#475569] dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 text-xs font-semibold transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => void handleConfirmDelete()}
-                disabled={isDeleting}
-                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 disabled:opacity-60 text-white text-xs font-bold shadow-xs transition-colors"
-              >
-                {isDeleting ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                ) : (
-                  <Trash2 className="w-3.5 h-3.5" />
-                )}
-                <span>{isDeleting ? 'Deleting...' : 'Delete Branch'}</span>
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Two-Step Operation Confirmation Modal (Add / Update / Delete / Import) */}
+      <OperationConfirmModal
+        isOpen={Boolean(pendingConfirm)}
+        operationType={
+          pendingConfirm
+            ? pendingConfirm.kind === 'import'
+              ? ('update' as OperationConfirmType)
+              : (pendingConfirm.kind as OperationConfirmType)
+            : 'add'
+        }
+        entityLabel={pendingConfirm?.kind === 'import' ? 'Branch Directory' : 'Branch'}
+        recordName={pendingConfirm?.recordName || ''}
+        recordDetails={pendingConfirm?.details || []}
+        actionDescription={
+          pendingConfirm?.kind === 'import'
+            ? 'All current branch records will be replaced with the imported Excel dataset.'
+            : undefined
+        }
+        isSubmitting={isExecutingConfirm}
+        errorMessage={confirmError}
+        onConfirm={handleConfirmOperation}
+        onCancel={() => {
+          if (!isExecutingConfirm) {
+            setPendingConfirm(null);
+            setConfirmError(null);
+          }
+        }}
+      />
     </>
   );
 
@@ -883,7 +992,7 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
 
             <button
               type="button"
-              onClick={() => openEditModal(selectedBranch)}
+              onClick={() => requestOpenEditModal(selectedBranch)}
               className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-white dark:bg-slate-800 border border-[#CBD5E1] dark:border-slate-700 hover:border-[#006B45] text-[#0F172A] dark:text-slate-100 text-xs font-semibold shadow-2xs transition-colors"
             >
               <Pencil className="w-3.5 h-3.5 text-[#006B45] dark:text-emerald-400" />
@@ -892,7 +1001,7 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
 
             <button
               type="button"
-              onClick={() => setDeletingRecord(selectedBranch)}
+              onClick={() => requestDeleteRecord(selectedBranch)}
               className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-800 hover:bg-rose-100 dark:hover:bg-rose-900/60 text-rose-700 dark:text-rose-300 text-xs font-semibold shadow-2xs transition-colors"
             >
               <Trash2 className="w-3.5 h-3.5" />
@@ -1218,7 +1327,7 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
           <div className="flex flex-wrap items-center gap-2 shrink-0">
             <button
               type="button"
-              onClick={openAddModal}
+              onClick={requestOpenAddModal}
               className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-white text-[#064E3B] hover:bg-emerald-50 text-xs font-extrabold shadow-xs transition-colors"
             >
               <Plus className="w-3.5 h-3.5" />
@@ -1273,6 +1382,29 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
               <RefreshCw className={`w-3.5 h-3.5 text-emerald-300 ${isLoadingDb ? 'animate-spin' : ''}`} />
               <span>Refresh Branch Data</span>
             </button>
+
+            <button
+              type="button"
+              onClick={openChangeCodeModal}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-black/25 hover:bg-black/35 text-emerald-100 text-xs font-semibold border border-white/15 transition-colors"
+              title="Change Admin Access Code"
+            >
+              <KeyRound className="w-3.5 h-3.5 text-emerald-300" />
+              <span>Access Code</span>
+            </button>
+
+            {isAuthorized && (
+              <button
+                type="button"
+                onClick={() => void lockSession()}
+                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-100 text-xs font-semibold border border-emerald-300/30 transition-colors"
+                title="Admin authorized — click to lock session"
+              >
+                <ShieldCheck className="w-3.5 h-3.5 text-emerald-300" />
+                <span>Unlocked</span>
+                <Lock className="w-3 h-3 text-emerald-200/80" />
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -1370,8 +1502,8 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                   </button>
                   <button
                     type="button"
-                    onClick={() => void handleConfirmImport()}
-                    disabled={isSavingImport}
+                    onClick={requestImportConfirm}
+                    disabled={isSavingImport || isExecutingConfirm}
                     className="px-4 py-2 rounded-xl bg-[#006B45] hover:bg-[#064E3B] disabled:opacity-60 text-white text-xs font-bold shadow-xs flex items-center gap-1.5"
                   >
                     {isSavingImport ? (
@@ -1647,7 +1779,7 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
             )}
             <button
               type="button"
-              onClick={openAddModal}
+              onClick={requestOpenAddModal}
               className="inline-flex items-center gap-1.5 px-4 py-2 bg-[#F0FDF4] dark:bg-emerald-950/60 text-[#006B45] dark:text-emerald-300 border border-[#D1FAE5] dark:border-emerald-800 text-xs font-semibold rounded-xl hover:bg-emerald-100 dark:hover:bg-emerald-900/60 transition-colors"
             >
               <Plus className="w-3.5 h-3.5" />
@@ -1852,7 +1984,7 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
 
                     <button
                       type="button"
-                      onClick={() => openEditModal(branch)}
+                      onClick={() => requestOpenEditModal(branch)}
                       className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-white dark:bg-slate-800 border border-[#CBD5E1] dark:border-slate-700 hover:border-[#006B45] text-[#0F172A] dark:text-slate-200 hover:text-[#006B45] dark:hover:text-emerald-400 text-[11px] font-semibold transition-colors"
                       title={`Edit ${branchTitle}`}
                     >
@@ -1862,7 +1994,7 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
 
                     <button
                       type="button"
-                      onClick={() => setDeletingRecord(branch)}
+                      onClick={() => requestDeleteRecord(branch)}
                       className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-800 hover:bg-rose-100 dark:hover:bg-rose-900/60 text-rose-700 dark:text-rose-300 text-[11px] font-semibold transition-colors"
                       title={`Delete ${branchTitle}`}
                     >
@@ -1968,7 +2100,7 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                           )}
                           <button
                             type="button"
-                            onClick={() => openEditModal(branch)}
+                            onClick={() => requestOpenEditModal(branch)}
                             className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-[#F8FAFC] dark:bg-slate-800 border border-[#CBD5E1] dark:border-slate-700 hover:border-[#006B45] text-[11px] font-semibold text-[#0F172A] dark:text-slate-200"
                             title={`Edit ${branchTitle}`}
                           >
@@ -1977,7 +2109,7 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                           </button>
                           <button
                             type="button"
-                            onClick={() => setDeletingRecord(branch)}
+                            onClick={() => requestDeleteRecord(branch)}
                             className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-800 hover:bg-rose-100 dark:hover:bg-rose-900/60 text-[11px] font-semibold text-rose-700 dark:text-rose-300"
                             title={`Delete ${branchTitle}`}
                           >

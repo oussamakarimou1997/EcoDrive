@@ -7,6 +7,8 @@ import { GoogleGenAI, Type } from '@google/genai';
 import {
   ValidationError,
   NotFoundError,
+  UnauthorizedError,
+  ConflictError,
   getInstructorsDatasetFromDb,
   createInstructorInDb,
   updateInstructorInDb,
@@ -17,6 +19,12 @@ import {
   updateBranchInfoInDb,
   deleteBranchInfoInDb,
   replaceBranchInfoDatasetInDb,
+  getAdminAuthStatus,
+  setupInitialAdminAccessCode,
+  verifyAdminAccessCodeAndCreateSession,
+  validateAdminSessionToken,
+  revokeAdminSessionToken,
+  changeAdminAccessCode,
 } from './serverDb';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -525,7 +533,148 @@ STRICT GROUNDING RULES:
 });
 
 // ---------------------------------------------------------------------------
-// API Route 5: Instructors CRUD (SQLite Database Persistence)
+// API Route 5: Admin Access Code Auth & Session Enforcement
+// ---------------------------------------------------------------------------
+const verifyAttempts = new Map<string, { count: number; blockedUntil: number }>();
+const MAX_VERIFY_FAILURES = 5;
+const VERIFY_LOCKOUT_MS = 30 * 1000;
+
+function getClientKey(req: express.Request): string {
+  const fwd = req.headers['x-forwarded-for'];
+  const ip = Array.isArray(fwd)
+    ? fwd[0]
+    : typeof fwd === 'string'
+      ? fwd.split(',')[0]?.trim()
+      : req.ip || 'unknown';
+  return ip || 'unknown';
+}
+
+function extractBearerToken(req: express.Request): string | null {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || typeof authHeader !== 'string') return null;
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  return match?.[1]?.trim() || null;
+}
+
+function requireAdminAuth(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) {
+  const token = extractBearerToken(req);
+  if (!validateAdminSessionToken(token)) {
+    return res.status(401).json({
+      error: 'Unauthorized: Valid Admin Access Code authorization is required for this operation.',
+      code: 'ADMIN_AUTH_REQUIRED',
+    });
+  }
+  next();
+}
+
+app.get('/api/admin/status', (req, res) => {
+  try {
+    const status = getAdminAuthStatus();
+    const token = extractBearerToken(req);
+    const authorized = validateAdminSessionToken(token);
+    return res.json({
+      configured: status.configured,
+      managedByEnv: status.managedByEnv,
+      authorized,
+    });
+  } catch (err) {
+    console.error('Error checking admin status:', err);
+    return res.status(500).json({ error: 'Unable to check admin security status.' });
+  }
+});
+
+app.post('/api/admin/setup', (req, res) => {
+  try {
+    const { accessCode } = req.body || {};
+    const session = setupInitialAdminAccessCode(accessCode);
+    return res.status(201).json(session);
+  } catch (err) {
+    if (err instanceof ValidationError) {
+      return res.status(400).json({ error: err.message, fieldErrors: err.fieldErrors });
+    }
+    if (err instanceof ConflictError) {
+      return res.status(409).json({ error: err.message });
+    }
+    console.error('Error setting up admin access code:', err);
+    return res.status(500).json({ error: 'Failed to configure Admin Access Code.' });
+  }
+});
+
+app.post('/api/admin/verify', (req, res) => {
+  const clientKey = getClientKey(req);
+  const now = Date.now();
+  const record = verifyAttempts.get(clientKey);
+  if (record && record.blockedUntil > now) {
+    const secondsLeft = Math.ceil((record.blockedUntil - now) / 1000);
+    return res.status(429).json({
+      error: `Too many invalid access code attempts. Please wait ${secondsLeft} seconds before trying again.`,
+    });
+  }
+
+  try {
+    const { accessCode } = req.body || {};
+    const session = verifyAdminAccessCodeAndCreateSession(accessCode);
+    verifyAttempts.delete(clientKey);
+    return res.json(session);
+  } catch (err) {
+    if (err instanceof UnauthorizedError) {
+      const prevCount = record && record.blockedUntil <= now ? record.count : 0;
+      const nextCount = prevCount + 1;
+      if (nextCount >= MAX_VERIFY_FAILURES) {
+        verifyAttempts.set(clientKey, {
+          count: 0,
+          blockedUntil: now + VERIFY_LOCKOUT_MS,
+        });
+      } else {
+        verifyAttempts.set(clientKey, {
+          count: nextCount,
+          blockedUntil: 0,
+        });
+      }
+      return res.status(401).json({ error: 'Access denied. Invalid Admin Access Code.' });
+    }
+    if (err instanceof ValidationError) {
+      return res.status(400).json({ error: err.message });
+    }
+    console.error('Error verifying admin access code:', err);
+    return res.status(500).json({ error: 'Unable to verify Admin Access Code.' });
+  }
+});
+
+app.post('/api/admin/change-code', requireAdminAuth, (req, res) => {
+  try {
+    const { currentCode, newCode } = req.body || {};
+    const session = changeAdminAccessCode(currentCode, newCode);
+    return res.json(session);
+  } catch (err) {
+    if (err instanceof UnauthorizedError) {
+      return res.status(401).json({ error: 'Access denied. Invalid Admin Access Code.' });
+    }
+    if (err instanceof ValidationError) {
+      return res.status(400).json({ error: err.message, fieldErrors: err.fieldErrors });
+    }
+    console.error('Error changing admin access code:', err);
+    return res.status(500).json({ error: 'Failed to update Admin Access Code.' });
+  }
+});
+
+app.post('/api/admin/logout', (req, res) => {
+  try {
+    const token = extractBearerToken(req);
+    revokeAdminSessionToken(token);
+    return res.json({ locked: true });
+  } catch (err) {
+    console.error('Error locking admin session:', err);
+    return res.status(500).json({ error: 'Unable to lock admin session.' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// API Route 6: Instructors CRUD (SQLite Database Persistence, Admin Protected)
 // ---------------------------------------------------------------------------
 app.get('/api/instructors', (_req, res) => {
   try {
@@ -537,7 +686,7 @@ app.get('/api/instructors', (_req, res) => {
   }
 });
 
-app.post('/api/instructors', (req, res) => {
+app.post('/api/instructors', requireAdminAuth, (req, res) => {
   try {
     const { fields, sheetName } = req.body || {};
     const created = createInstructorInDb(fields, sheetName);
@@ -551,7 +700,7 @@ app.post('/api/instructors', (req, res) => {
   }
 });
 
-app.put('/api/instructors/:rowKey', (req, res) => {
+app.put('/api/instructors/:rowKey', requireAdminAuth, (req, res) => {
   try {
     const rowKey = decodeURIComponent(req.params.rowKey);
     const { fields } = req.body || {};
@@ -569,7 +718,7 @@ app.put('/api/instructors/:rowKey', (req, res) => {
   }
 });
 
-app.delete('/api/instructors/:rowKey', (req, res) => {
+app.delete('/api/instructors/:rowKey', requireAdminAuth, (req, res) => {
   try {
     const rowKey = decodeURIComponent(req.params.rowKey);
     deleteInstructorInDb(rowKey);
@@ -583,7 +732,7 @@ app.delete('/api/instructors/:rowKey', (req, res) => {
   }
 });
 
-app.post('/api/instructors/import', (req, res) => {
+app.post('/api/instructors/import', requireAdminAuth, (req, res) => {
   try {
     const dataset = replaceInstructorsDatasetInDb(req.body);
     return res.json(dataset);
@@ -597,7 +746,7 @@ app.post('/api/instructors/import', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// API Route 6: Branch Information CRUD (SQLite Database Persistence)
+// API Route 7: Branch Information CRUD (SQLite Database Persistence, Admin Protected)
 // ---------------------------------------------------------------------------
 app.get('/api/branch-info', (_req, res) => {
   try {
@@ -609,7 +758,7 @@ app.get('/api/branch-info', (_req, res) => {
   }
 });
 
-app.post('/api/branch-info', (req, res) => {
+app.post('/api/branch-info', requireAdminAuth, (req, res) => {
   try {
     const { fields, sheetName } = req.body || {};
     const created = createBranchInfoInDb(fields, sheetName);
@@ -623,7 +772,7 @@ app.post('/api/branch-info', (req, res) => {
   }
 });
 
-app.put('/api/branch-info/:rowKey', (req, res) => {
+app.put('/api/branch-info/:rowKey', requireAdminAuth, (req, res) => {
   try {
     const rowKey = decodeURIComponent(req.params.rowKey);
     const { fields } = req.body || {};
@@ -641,7 +790,7 @@ app.put('/api/branch-info/:rowKey', (req, res) => {
   }
 });
 
-app.delete('/api/branch-info/:rowKey', (req, res) => {
+app.delete('/api/branch-info/:rowKey', requireAdminAuth, (req, res) => {
   try {
     const rowKey = decodeURIComponent(req.params.rowKey);
     deleteBranchInfoInDb(rowKey);
@@ -655,7 +804,7 @@ app.delete('/api/branch-info/:rowKey', (req, res) => {
   }
 });
 
-app.post('/api/branch-info/import', (req, res) => {
+app.post('/api/branch-info/import', requireAdminAuth, (req, res) => {
   try {
     const dataset = replaceBranchInfoDatasetInDb(req.body);
     return res.json(dataset);

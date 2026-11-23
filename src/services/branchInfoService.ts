@@ -12,6 +12,7 @@ import {
   DetectedBranchInfoColumns,
   DynamicBranchFilterConfig,
 } from '../types/branchInfo';
+import { AdminAuthError } from './adminAuthService';
 
 /**
  * Automatically detects semantic column roles from the actual Excel headers.
@@ -157,6 +158,12 @@ async function parseBranchJsonError(res: Response, fallbackMsg: string): Promise
   } catch {
     // ignore JSON parse error
   }
+  if (res.status === 401) {
+    throw new AdminAuthError(
+      body.error || 'Unauthorized: Valid Admin Access Code authorization is required.',
+      401
+    );
+  }
   if (res.status === 400) {
     throw new BranchApiValidationError(body.error || fallbackMsg, body.fieldErrors || {});
   }
@@ -173,11 +180,15 @@ export async function fetchBranchInfoDataset(): Promise<BranchInfoDataset> {
 
 export async function createBranchInfoRecord(
   fields: Record<string, string>,
+  adminToken: string,
   sheetName = 'Sheet1'
 ): Promise<BranchInfoRecord> {
   const res = await fetch('/api/branch-info', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${adminToken}`,
+    },
     body: JSON.stringify({ fields, sheetName }),
   });
   if (!res.ok) {
@@ -189,11 +200,15 @@ export async function createBranchInfoRecord(
 
 export async function updateBranchInfoRecord(
   rowKey: string,
-  fields: Record<string, string>
+  fields: Record<string, string>,
+  adminToken: string
 ): Promise<BranchInfoRecord> {
   const res = await fetch(`/api/branch-info/${encodeURIComponent(rowKey)}`, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${adminToken}`,
+    },
     body: JSON.stringify({ fields }),
   });
   if (!res.ok) {
@@ -203,27 +218,39 @@ export async function updateBranchInfoRecord(
   return data.record;
 }
 
-export async function deleteBranchInfoRecord(rowKey: string): Promise<void> {
+export async function deleteBranchInfoRecord(
+  rowKey: string,
+  adminToken: string
+): Promise<void> {
   const res = await fetch(`/api/branch-info/${encodeURIComponent(rowKey)}`, {
     method: 'DELETE',
+    headers: {
+      Authorization: `Bearer ${adminToken}`,
+    },
   });
   if (!res.ok) {
     await parseBranchJsonError(res, 'Failed to delete branch.');
   }
 }
 
-export async function saveImportedBranchInfoDataset(payload: {
-  fileName: string;
-  sheetNames: string[];
-  columns: string[];
-  detectedColumns: DetectedBranchInfoColumns;
-  records: BranchInfoRecord[];
-  notes: string[];
-  importedAt: string;
-}): Promise<BranchInfoDataset> {
+export async function saveImportedBranchInfoDataset(
+  payload: {
+    fileName: string;
+    sheetNames: string[];
+    columns: string[];
+    detectedColumns: DetectedBranchInfoColumns;
+    records: BranchInfoRecord[];
+    notes: string[];
+    importedAt: string;
+  },
+  adminToken: string
+): Promise<BranchInfoDataset> {
   const res = await fetch('/api/branch-info/import', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${adminToken}`,
+    },
     body: JSON.stringify(payload),
   });
   if (!res.ok) {

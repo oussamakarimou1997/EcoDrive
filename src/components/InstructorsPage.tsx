@@ -31,6 +31,9 @@ import {
   Trash2,
   Loader2,
   Database,
+  Lock,
+  ShieldCheck,
+  KeyRound,
 } from 'lucide-react';
 import {
   ExcelImportPreview,
@@ -49,9 +52,12 @@ import {
   saveImportedInstructorsDataset,
   updateInstructorRecord,
 } from '../services/instructorsService';
+import { AdminAuthError } from '../services/adminAuthService';
+import { ToastVariant, useAdminAuth } from '../context/AdminAuthContext';
+import { OperationConfirmModal, OperationConfirmType } from './OperationConfirmModal';
 
 interface InstructorsPageProps {
-  onShowToast?: (message: string) => void;
+  onShowToast?: (message: string, variant?: ToastVariant) => void;
 }
 
 type SortDirection = 'asc' | 'desc';
@@ -101,12 +107,51 @@ export const InstructorsPage: React.FC<InstructorsPageProps> = ({ onShowToast })
   const [formGeneralError, setFormGeneralError] = useState<string | null>(null);
   const [isSubmittingForm, setIsSubmittingForm] = useState(false);
 
-  const [deletingRecord, setDeletingRecord] = useState<InstructorRecord | null>(null);
-  const [isDeleting, setIsDeleting] = useState(false);
+  // 8. Admin Auth + Two-Step Operation Confirmation State
+  const {
+    isAuthorized,
+    getValidToken,
+    requireAdminAuthorization,
+    openChangeCodeModal,
+    lockSession,
+    handleAuthFailure,
+  } = useAdminAuth();
 
-  const notify = (msg: string) => {
+  type PendingInstructorConfirm =
+    | {
+        kind: 'add';
+        fields: Record<string, string>;
+        recordName: string;
+        details: string[];
+      }
+    | {
+        kind: 'update';
+        record: InstructorRecord;
+        fields: Record<string, string>;
+        recordName: string;
+        details: string[];
+      }
+    | {
+        kind: 'delete';
+        record: InstructorRecord;
+        recordName: string;
+        details: string[];
+      }
+    | {
+        kind: 'import';
+        preview: ExcelImportPreview;
+        recordName: string;
+        details: string[];
+      };
+
+  const [pendingConfirm, setPendingConfirm] = useState<PendingInstructorConfirm | null>(null);
+  const [confirmError, setConfirmError] = useState<string | null>(null);
+  const [isExecutingConfirm, setIsExecutingConfirm] = useState(false);
+  const operationLockRef = useRef(false);
+
+  const notify = (msg: string, variant: ToastVariant = 'success') => {
     if (onShowToast) {
-      onShowToast(msg);
+      onShowToast(msg, variant);
     }
   };
 
@@ -360,10 +405,30 @@ export const InstructorsPage: React.FC<InstructorsPageProps> = ({ onShowToast })
     setCurrentPage(1);
   };
 
+  const getInstructorDisplayName = (fields: Record<string, string>, fallbackKey = ''): string => {
+    const nameCol = cols.nameCol || dataset.columns[1] || dataset.columns[0];
+    const name = nameCol ? (fields[nameCol] || '').trim() : '';
+    return name || fallbackKey || 'Instructor';
+  };
+
+  const getInstructorDetailsList = (fields: Record<string, string>): string[] => {
+    const details: string[] = [];
+    if (cols.idCol && fields[cols.idCol]?.trim()) {
+      details.push(`ID: ${fields[cols.idCol].trim()}`);
+    }
+    if (cols.branchCol && fields[cols.branchCol]?.trim()) {
+      details.push(`Branch: ${fields[cols.branchCol].trim()}`);
+    }
+    if (cols.phoneCol && fields[cols.phoneCol]?.trim()) {
+      details.push(`Phone: ${fields[cols.phoneCol].trim()}`);
+    }
+    return details;
+  };
+
   // =========================================================
-  // CRUD HANDLERS (Add, Edit, Delete with Form Validation)
+  // CRUD HANDLERS (Admin Code Auth -> Form/Validation -> Confirm Modal)
   // =========================================================
-  const openAddModal = () => {
+  const openAddModalNow = () => {
     const empty: Record<string, string> = {};
     dataset.columns.forEach((c) => {
       empty[c] = '';
@@ -375,7 +440,13 @@ export const InstructorsPage: React.FC<InstructorsPageProps> = ({ onShowToast })
     setFormModalMode('add');
   };
 
-  const openEditModal = (record: InstructorRecord) => {
+  const requestOpenAddModal = () => {
+    requireAdminAuthorization('Add New Instructor', () => {
+      openAddModalNow();
+    });
+  };
+
+  const openEditModalNow = (record: InstructorRecord) => {
     const initial: Record<string, string> = {};
     dataset.columns.forEach((c) => {
       initial[c] = record.fields[c] ?? '';
@@ -387,8 +458,28 @@ export const InstructorsPage: React.FC<InstructorsPageProps> = ({ onShowToast })
     setFormModalMode('edit');
   };
 
+  const requestOpenEditModal = (record: InstructorRecord) => {
+    const label = getInstructorDisplayName(record.fields, record._rowKey);
+    requireAdminAuthorization(`Edit Instructor: ${label}`, () => {
+      openEditModalNow(record);
+    });
+  };
+
+  const requestDeleteRecord = (record: InstructorRecord) => {
+    const label = getInstructorDisplayName(record.fields, record._rowKey);
+    requireAdminAuthorization(`Delete Instructor: ${label}`, () => {
+      setConfirmError(null);
+      setPendingConfirm({
+        kind: 'delete',
+        record,
+        recordName: label,
+        details: getInstructorDetailsList(record.fields),
+      });
+    });
+  };
+
   const closeFormModal = () => {
-    if (isSubmittingForm) return;
+    if (isSubmittingForm || isExecutingConfirm) return;
     setFormModalMode(null);
     setEditingRecord(null);
     setFormFieldErrors({});
@@ -448,8 +539,10 @@ export const InstructorsPage: React.FC<InstructorsPageProps> = ({ onShowToast })
     return errs;
   };
 
-  const handleSubmitForm = async (e: React.FormEvent) => {
+  const handleSubmitForm = (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmittingForm || isExecutingConfirm || operationLockRef.current) return;
+
     const trimmed: Record<string, string> = {};
     dataset.columns.forEach((c) => {
       trimmed[c] = (formFields[c] ?? '').trim();
@@ -465,22 +558,54 @@ export const InstructorsPage: React.FC<InstructorsPageProps> = ({ onShowToast })
       return;
     }
 
-    setIsSubmittingForm(true);
     setFormFieldErrors({});
     setFormGeneralError(null);
+    setConfirmError(null);
+
+    if (formModalMode === 'add') {
+      const recordName = getInstructorDisplayName(trimmed);
+      setPendingConfirm({
+        kind: 'add',
+        fields: trimmed,
+        recordName,
+        details: getInstructorDetailsList(trimmed),
+      });
+    } else if (formModalMode === 'edit' && editingRecord) {
+      const recordName = getInstructorDisplayName(trimmed, editingRecord._rowKey);
+      setPendingConfirm({
+        kind: 'update',
+        record: editingRecord,
+        fields: trimmed,
+        recordName,
+        details: getInstructorDetailsList(trimmed),
+      });
+    }
+  };
+
+  const runConfirmedMutation = async (action: PendingInstructorConfirm, token: string) => {
+    if (operationLockRef.current) return;
+    operationLockRef.current = true;
+    setIsExecutingConfirm(true);
+    setIsSubmittingForm(action.kind === 'add' || action.kind === 'update');
+    if (action.kind === 'import') {
+      setIsSavingImport(true);
+    }
+    setConfirmError(null);
 
     try {
-      if (formModalMode === 'add') {
-        const created = await createInstructorRecord(trimmed);
+      if (action.kind === 'add') {
+        const created = await createInstructorRecord(action.fields, token);
         setDataset((prev) => ({
           ...prev,
           records: [created, ...prev.records],
         }));
         setCurrentPage(1);
+        setPendingConfirm(null);
         setFormModalMode(null);
-        notify(`Added instructor: ${cols.nameCol ? created.fields[cols.nameCol] : created._rowKey}`);
-      } else if (formModalMode === 'edit' && editingRecord) {
-        const updated = await updateInstructorRecord(editingRecord._rowKey, trimmed);
+        setEditingRecord(null);
+        notify('Record added successfully!', 'success');
+      } else if (action.kind === 'update') {
+        const updated = await updateInstructorRecord(action.record._rowKey, action.fields, token);
         setDataset((prev) => ({
           ...prev,
           records: prev.records.map((r) => (r._rowKey === updated._rowKey ? updated : r)),
@@ -488,44 +613,85 @@ export const InstructorsPage: React.FC<InstructorsPageProps> = ({ onShowToast })
         if (selectedInstructor?._rowKey === updated._rowKey) {
           setSelectedInstructor(updated);
         }
+        setPendingConfirm(null);
         setFormModalMode(null);
         setEditingRecord(null);
-        notify(`Updated instructor: ${cols.nameCol ? updated.fields[cols.nameCol] : updated._rowKey}`);
+        notify('Record updated successfully!', 'success');
+      } else if (action.kind === 'delete') {
+        await deleteInstructorRecord(action.record._rowKey, token);
+        setDataset((prev) => ({
+          ...prev,
+          records: prev.records.filter((r) => r._rowKey !== action.record._rowKey),
+        }));
+        if (selectedInstructor?._rowKey === action.record._rowKey) {
+          setSelectedInstructor(null);
+        }
+        setPendingConfirm(null);
+        notify('Record deleted successfully!', 'success');
+      } else if (action.kind === 'import') {
+        const savedDataset = await saveImportedInstructorsDataset(
+          {
+            fileName: action.preview.fileName,
+            sheetNames: action.preview.sheetNames,
+            columns: action.preview.columns,
+            detectedColumns: action.preview.detectedColumns,
+            records: action.preview.records,
+            importedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          },
+          token
+        );
+
+        setDataset(savedDataset);
+        setSelectedInstructor(null);
+        handleClearFilters();
+        setSortColumn(null);
+        setImportPreview(null);
+        setImportError(null);
+        setShowImportPanel(false);
+        setPendingConfirm(null);
+        notify('Record updated successfully!', 'success');
       }
     } catch (err) {
-      if (err instanceof ApiValidationError) {
-        setFormFieldErrors(err.fieldErrors);
-        setFormGeneralError(err.message);
+      if (err instanceof AdminAuthError) {
+        setPendingConfirm(null);
+        handleAuthFailure(`Re-authorize: ${action.recordName}`, (newToken) => {
+          setPendingConfirm(action);
+          void newToken;
+        });
+      } else if (err instanceof ApiValidationError) {
+        setPendingConfirm(null);
+        if (action.kind === 'add' || action.kind === 'update') {
+          setFormFieldErrors(err.fieldErrors);
+          setFormGeneralError(err.message);
+        } else if (action.kind === 'import') {
+          setImportError(err.message);
+        }
+        notify(err.message, 'error');
       } else {
-        setFormGeneralError(err instanceof Error ? err.message : 'Unable to save instructor.');
+        const msg = err instanceof Error ? err.message : 'Operation failed. Please try again.';
+        setConfirmError(msg);
+        notify(msg, 'error');
       }
     } finally {
+      operationLockRef.current = false;
+      setIsExecutingConfirm(false);
       setIsSubmittingForm(false);
+      setIsSavingImport(false);
     }
   };
 
-  const handleConfirmDelete = async () => {
-    if (!deletingRecord) return;
-    setIsDeleting(true);
-    try {
-      await deleteInstructorRecord(deletingRecord._rowKey);
-      const deletedLabel = cols.nameCol
-        ? deletingRecord.fields[cols.nameCol] || deletingRecord._rowKey
-        : deletingRecord._rowKey;
-      setDataset((prev) => ({
-        ...prev,
-        records: prev.records.filter((r) => r._rowKey !== deletingRecord._rowKey),
-      }));
-      if (selectedInstructor?._rowKey === deletingRecord._rowKey) {
-        setSelectedInstructor(null);
-      }
-      setDeletingRecord(null);
-      notify(`Deleted instructor: ${deletedLabel}`);
-    } catch (err) {
-      notify(err instanceof Error ? err.message : 'Failed to delete instructor.');
-    } finally {
-      setIsDeleting(false);
+  const handleConfirmOperation = async () => {
+    if (!pendingConfirm || operationLockRef.current) return;
+    const actionSnapshot = pendingConfirm;
+    const token = getValidToken();
+    if (!token) {
+      setPendingConfirm(null);
+      requireAdminAuthorization(`Authorize: ${actionSnapshot.recordName}`, () => {
+        setPendingConfirm(actionSnapshot);
+      });
+      return;
     }
+    await runConfirmedMutation(actionSnapshot, token);
   };
 
   // Handle Excel / CSV File Upload
@@ -552,39 +718,22 @@ export const InstructorsPage: React.FC<InstructorsPageProps> = ({ onShowToast })
     }
   };
 
-  // Confirm Import Preview -> persist in SQLite DB
-  const handleConfirmImport = async () => {
+  // Confirm Import Preview -> Admin Auth -> Second Confirmation Modal
+  const requestImportConfirm = () => {
     if (!importPreview) return;
-    setIsSavingImport(true);
-    setImportError(null);
-
-    try {
-      const savedDataset = await saveImportedInstructorsDataset({
-        fileName: importPreview.fileName,
-        sheetNames: importPreview.sheetNames,
-        columns: importPreview.columns,
-        detectedColumns: importPreview.detectedColumns,
-        records: importPreview.records,
-        importedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    const previewSnapshot = importPreview;
+    requireAdminAuthorization(`Import Dataset (${previewSnapshot.fileName})`, () => {
+      setConfirmError(null);
+      setPendingConfirm({
+        kind: 'import',
+        preview: previewSnapshot,
+        recordName: `${previewSnapshot.fileName} (${previewSnapshot.records.length} Instructors)`,
+        details: [
+          `Worksheets: ${previewSnapshot.sheetNames.join(', ')}`,
+          `Replaces current instructors table`,
+        ],
       });
-
-      setDataset(savedDataset);
-      setSelectedInstructor(null);
-      handleClearFilters();
-      setSortColumn(null);
-      setImportPreview(null);
-      setImportError(null);
-      setShowImportPanel(false);
-      notify(
-        `Saved ${savedDataset.records.length} instructors from ${savedDataset.fileName} to database`
-      );
-    } catch (err) {
-      setImportError(
-        err instanceof Error ? err.message : 'Failed to save imported instructors to database.'
-      );
-    } finally {
-      setIsSavingImport(false);
-    }
+    });
   };
 
   const getSuggestedDatalistId = (col: string): string | undefined => {
@@ -771,76 +920,34 @@ export const InstructorsPage: React.FC<InstructorsPageProps> = ({ onShowToast })
         </div>
       )}
 
-      {/* Delete Instructor Confirmation Modal */}
-      {deletingRecord && (
-        <div
-          className="fixed inset-0 z-50 bg-slate-900/60 dark:bg-black/75 backdrop-blur-xs flex items-center justify-center p-4"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="delete-instructor-title"
-        >
-          <div className="bg-white dark:bg-[#0F172A] rounded-2xl border border-[#E2E8F0] dark:border-slate-700 shadow-2xl max-w-md w-full overflow-hidden">
-            <div className="p-5 space-y-4">
-              <div className="flex items-start gap-3">
-                <div className="w-10 h-10 rounded-xl bg-rose-50 dark:bg-rose-950/60 border border-rose-200 dark:border-rose-800 text-rose-600 dark:text-rose-400 flex items-center justify-center shrink-0">
-                  <Trash2 className="w-5 h-5" />
-                </div>
-                <div>
-                  <h3
-                    id="delete-instructor-title"
-                    className="text-base font-extrabold text-[#0F172A] dark:text-slate-100"
-                  >
-                    Confirm Delete Instructor
-                  </h3>
-                  <p className="text-xs text-[#64748B] dark:text-slate-400 mt-1">
-                    Are you sure you want to permanently remove this instructor from the database? This action cannot be undone.
-                  </p>
-                </div>
-              </div>
-
-              <div className="bg-[#F8FAFC] dark:bg-slate-900 border border-[#E2E8F0] dark:border-slate-800 rounded-xl p-3.5 text-xs space-y-1">
-                <div className="font-extrabold text-[#0F172A] dark:text-slate-100 text-sm">
-                  {cols.nameCol
-                    ? formatCellDisplay(deletingRecord.fields[cols.nameCol])
-                    : deletingRecord._rowKey}
-                </div>
-                <div className="flex flex-wrap items-center gap-3 text-[#64748B] dark:text-slate-400">
-                  {cols.idCol && deletingRecord.fields[cols.idCol] && (
-                    <span className="font-mono">ID: {deletingRecord.fields[cols.idCol]}</span>
-                  )}
-                  {cols.branchCol && deletingRecord.fields[cols.branchCol] && (
-                    <span>Branch: {deletingRecord.fields[cols.branchCol]}</span>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            <div className="px-5 py-3.5 bg-[#F8FAFC] dark:bg-slate-900/80 border-t border-[#E2E8F0] dark:border-slate-800 flex items-center justify-end gap-2.5">
-              <button
-                type="button"
-                onClick={() => !isDeleting && setDeletingRecord(null)}
-                disabled={isDeleting}
-                className="px-4 py-2 rounded-xl bg-white dark:bg-slate-800 border border-[#CBD5E1] dark:border-slate-700 text-[#475569] dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 text-xs font-semibold transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => void handleConfirmDelete()}
-                disabled={isDeleting}
-                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 disabled:opacity-60 text-white text-xs font-bold shadow-xs transition-colors"
-              >
-                {isDeleting ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                ) : (
-                  <Trash2 className="w-3.5 h-3.5" />
-                )}
-                <span>{isDeleting ? 'Deleting...' : 'Delete Instructor'}</span>
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Two-Step Operation Confirmation Modal (Add / Update / Delete / Import) */}
+      <OperationConfirmModal
+        isOpen={Boolean(pendingConfirm)}
+        operationType={
+          pendingConfirm
+            ? pendingConfirm.kind === 'import'
+              ? ('update' as OperationConfirmType)
+              : (pendingConfirm.kind as OperationConfirmType)
+            : 'add'
+        }
+        entityLabel={pendingConfirm?.kind === 'import' ? 'Instructors Dataset' : 'Instructor'}
+        recordName={pendingConfirm?.recordName || ''}
+        recordDetails={pendingConfirm?.details || []}
+        actionDescription={
+          pendingConfirm?.kind === 'import'
+            ? 'All current instructor records will be replaced with the imported Excel dataset.'
+            : undefined
+        }
+        isSubmitting={isExecutingConfirm}
+        errorMessage={confirmError}
+        onConfirm={handleConfirmOperation}
+        onCancel={() => {
+          if (!isExecutingConfirm) {
+            setPendingConfirm(null);
+            setConfirmError(null);
+          }
+        }}
+      />
     </>
   );
 
@@ -910,7 +1017,7 @@ export const InstructorsPage: React.FC<InstructorsPageProps> = ({ onShowToast })
 
             <button
               type="button"
-              onClick={() => openEditModal(selectedInstructor)}
+              onClick={() => requestOpenEditModal(selectedInstructor)}
               className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-white dark:bg-slate-800 border border-[#CBD5E1] dark:border-slate-700 hover:border-[#006B45] text-[#0F172A] dark:text-slate-100 text-xs font-semibold shadow-2xs transition-colors"
             >
               <Pencil className="w-3.5 h-3.5 text-[#006B45] dark:text-emerald-400" />
@@ -919,7 +1026,7 @@ export const InstructorsPage: React.FC<InstructorsPageProps> = ({ onShowToast })
 
             <button
               type="button"
-              onClick={() => setDeletingRecord(selectedInstructor)}
+              onClick={() => requestDeleteRecord(selectedInstructor)}
               className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-800 hover:bg-rose-100 dark:hover:bg-rose-900/60 text-rose-700 dark:text-rose-300 text-xs font-semibold shadow-2xs transition-colors"
             >
               <Trash2 className="w-3.5 h-3.5" />
@@ -1112,7 +1219,7 @@ export const InstructorsPage: React.FC<InstructorsPageProps> = ({ onShowToast })
           <div className="flex flex-wrap items-center gap-2 shrink-0">
             <button
               type="button"
-              onClick={openAddModal}
+              onClick={requestOpenAddModal}
               className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-emerald-400 hover:bg-emerald-300 text-[#064E3B] text-xs font-extrabold shadow-xs transition-colors"
             >
               <Plus className="w-3.5 h-3.5 stroke-[2.5]" />
@@ -1167,6 +1274,29 @@ export const InstructorsPage: React.FC<InstructorsPageProps> = ({ onShowToast })
               <RefreshCw className={`w-3.5 h-3.5 text-emerald-300 ${isLoadingDb ? 'animate-spin' : ''}`} />
               <span>Refresh Data</span>
             </button>
+
+            <button
+              type="button"
+              onClick={openChangeCodeModal}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-black/25 hover:bg-black/35 text-emerald-100 text-xs font-semibold border border-white/15 transition-colors"
+              title="Change Admin Access Code"
+            >
+              <KeyRound className="w-3.5 h-3.5 text-emerald-300" />
+              <span>Access Code</span>
+            </button>
+
+            {isAuthorized && (
+              <button
+                type="button"
+                onClick={() => void lockSession()}
+                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-100 text-xs font-semibold border border-emerald-300/30 transition-colors"
+                title="Admin authorized — click to lock session"
+              >
+                <ShieldCheck className="w-3.5 h-3.5 text-emerald-300" />
+                <span>Unlocked</span>
+                <Lock className="w-3 h-3 text-emerald-200/80" />
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -1270,8 +1400,8 @@ export const InstructorsPage: React.FC<InstructorsPageProps> = ({ onShowToast })
                   </button>
                   <button
                     type="button"
-                    onClick={() => void handleConfirmImport()}
-                    disabled={isSavingImport}
+                    onClick={requestImportConfirm}
+                    disabled={isSavingImport || isExecutingConfirm}
                     className="px-4 py-2 rounded-xl bg-[#006B45] hover:bg-[#064E3B] disabled:opacity-60 text-white text-xs font-bold shadow-xs flex items-center gap-1.5"
                   >
                     {isSavingImport ? (
@@ -1796,7 +1926,7 @@ export const InstructorsPage: React.FC<InstructorsPageProps> = ({ onShowToast })
 
                           <button
                             type="button"
-                            onClick={() => openEditModal(item)}
+                            onClick={() => requestOpenEditModal(item)}
                             className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-[#F8FAFC] dark:bg-slate-800 hover:bg-[#F0FDF4] dark:hover:bg-emerald-950/60 text-[#0F172A] dark:text-slate-200 hover:text-[#006B45] dark:hover:text-emerald-300 border border-[#CBD5E1] dark:border-slate-700 hover:border-[#006B45] text-[11px] font-semibold transition-colors"
                             title="Edit Instructor"
                           >
@@ -1806,7 +1936,7 @@ export const InstructorsPage: React.FC<InstructorsPageProps> = ({ onShowToast })
 
                           <button
                             type="button"
-                            onClick={() => setDeletingRecord(item)}
+                            onClick={() => requestDeleteRecord(item)}
                             className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-rose-50 dark:bg-rose-950/40 hover:bg-rose-100 dark:hover:bg-rose-900/60 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-800/70 text-[11px] font-semibold transition-colors"
                             title="Delete Instructor"
                           >

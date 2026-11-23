@@ -10,6 +10,7 @@ import {
   InstructorRecord,
   InstructorsDataset,
 } from '../types/instructors';
+import { AdminAuthError } from './adminAuthService';
 
 /**
  * Automatically detects standard instructor column roles based on actual Excel headers.
@@ -107,6 +108,12 @@ async function parseJsonError(res: Response, fallbackMsg: string): Promise<never
   } catch {
     // ignore JSON parse failure
   }
+  if (res.status === 401) {
+    throw new AdminAuthError(
+      body.error || 'Unauthorized: Valid Admin Access Code authorization is required.',
+      401
+    );
+  }
   if (res.status === 400) {
     throw new ApiValidationError(body.error || fallbackMsg, body.fieldErrors || {});
   }
@@ -123,11 +130,15 @@ export async function fetchInstructorsDataset(): Promise<InstructorsDataset> {
 
 export async function createInstructorRecord(
   fields: Record<string, string>,
+  adminToken: string,
   sheetName = 'Sheet1'
 ): Promise<InstructorRecord> {
   const res = await fetch('/api/instructors', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${adminToken}`,
+    },
     body: JSON.stringify({ fields, sheetName }),
   });
   if (!res.ok) {
@@ -139,11 +150,15 @@ export async function createInstructorRecord(
 
 export async function updateInstructorRecord(
   rowKey: string,
-  fields: Record<string, string>
+  fields: Record<string, string>,
+  adminToken: string
 ): Promise<InstructorRecord> {
   const res = await fetch(`/api/instructors/${encodeURIComponent(rowKey)}`, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${adminToken}`,
+    },
     body: JSON.stringify({ fields }),
   });
   if (!res.ok) {
@@ -153,26 +168,38 @@ export async function updateInstructorRecord(
   return data.record;
 }
 
-export async function deleteInstructorRecord(rowKey: string): Promise<void> {
+export async function deleteInstructorRecord(
+  rowKey: string,
+  adminToken: string
+): Promise<void> {
   const res = await fetch(`/api/instructors/${encodeURIComponent(rowKey)}`, {
     method: 'DELETE',
+    headers: {
+      Authorization: `Bearer ${adminToken}`,
+    },
   });
   if (!res.ok) {
     await parseJsonError(res, 'Failed to delete instructor.');
   }
 }
 
-export async function saveImportedInstructorsDataset(payload: {
-  fileName: string;
-  sheetNames: string[];
-  columns: string[];
-  detectedColumns: DetectedInstructorColumns;
-  records: InstructorRecord[];
-  importedAt: string;
-}): Promise<InstructorsDataset> {
+export async function saveImportedInstructorsDataset(
+  payload: {
+    fileName: string;
+    sheetNames: string[];
+    columns: string[];
+    detectedColumns: DetectedInstructorColumns;
+    records: InstructorRecord[];
+    importedAt: string;
+  },
+  adminToken: string
+): Promise<InstructorsDataset> {
   const res = await fetch('/api/instructors/import', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${adminToken}`,
+    },
     body: JSON.stringify(payload),
   });
   if (!res.ok) {
