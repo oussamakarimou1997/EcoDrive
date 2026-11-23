@@ -91,6 +91,96 @@ export function getDefaultInstructorsDataset(): InstructorsDataset {
   };
 }
 
+export class ApiValidationError extends Error {
+  public fieldErrors: Record<string, string>;
+  constructor(message: string, fieldErrors: Record<string, string> = {}) {
+    super(message);
+    this.name = 'ApiValidationError';
+    this.fieldErrors = fieldErrors;
+  }
+}
+
+async function parseJsonError(res: Response, fallbackMsg: string): Promise<never> {
+  let body: { error?: string; fieldErrors?: Record<string, string> } = {};
+  try {
+    body = (await res.json()) as { error?: string; fieldErrors?: Record<string, string> };
+  } catch {
+    // ignore JSON parse failure
+  }
+  if (res.status === 400) {
+    throw new ApiValidationError(body.error || fallbackMsg, body.fieldErrors || {});
+  }
+  throw new Error(body.error || fallbackMsg);
+}
+
+export async function fetchInstructorsDataset(): Promise<InstructorsDataset> {
+  const res = await fetch('/api/instructors');
+  if (!res.ok) {
+    await parseJsonError(res, 'Failed to load instructors from database.');
+  }
+  return (await res.json()) as InstructorsDataset;
+}
+
+export async function createInstructorRecord(
+  fields: Record<string, string>,
+  sheetName = 'Sheet1'
+): Promise<InstructorRecord> {
+  const res = await fetch('/api/instructors', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fields, sheetName }),
+  });
+  if (!res.ok) {
+    await parseJsonError(res, 'Failed to add instructor.');
+  }
+  const data = (await res.json()) as { record: InstructorRecord };
+  return data.record;
+}
+
+export async function updateInstructorRecord(
+  rowKey: string,
+  fields: Record<string, string>
+): Promise<InstructorRecord> {
+  const res = await fetch(`/api/instructors/${encodeURIComponent(rowKey)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fields }),
+  });
+  if (!res.ok) {
+    await parseJsonError(res, 'Failed to update instructor.');
+  }
+  const data = (await res.json()) as { record: InstructorRecord };
+  return data.record;
+}
+
+export async function deleteInstructorRecord(rowKey: string): Promise<void> {
+  const res = await fetch(`/api/instructors/${encodeURIComponent(rowKey)}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) {
+    await parseJsonError(res, 'Failed to delete instructor.');
+  }
+}
+
+export async function saveImportedInstructorsDataset(payload: {
+  fileName: string;
+  sheetNames: string[];
+  columns: string[];
+  detectedColumns: DetectedInstructorColumns;
+  records: InstructorRecord[];
+  importedAt: string;
+}): Promise<InstructorsDataset> {
+  const res = await fetch('/api/instructors/import', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    await parseJsonError(res, 'Failed to save imported instructors file.');
+  }
+  return (await res.json()) as InstructorsDataset;
+}
+
 /**
  * Extracts exact string value from a SheetJS cell without scientific notation corruption on phone numbers/IDs.
  */

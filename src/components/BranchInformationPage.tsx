@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useRef } from 'react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
 import {
   Building2,
   Search,
@@ -22,6 +22,11 @@ import {
   LayoutGrid,
   Table2,
   Info,
+  Plus,
+  Pencil,
+  Trash2,
+  Loader2,
+  Database,
 } from 'lucide-react';
 import {
   BranchInfoDataset,
@@ -29,11 +34,18 @@ import {
   BranchInfoRecord,
 } from '../types/branchInfo';
 import {
+  BranchApiValidationError,
+  buildBranchFilterConfigs,
   buildGoogleMapsHref,
+  createBranchInfoRecord,
+  deleteBranchInfoRecord,
   exportBranchInfoToCSV,
   exportBranchInfoToExcel,
+  fetchBranchInfoDataset,
   getDefaultBranchInfoDataset,
   parseBranchInfoWorkbook,
+  saveImportedBranchInfoDataset,
+  updateBranchInfoRecord,
 } from '../services/branchInfoService';
 
 interface BranchInformationPageProps {
@@ -43,10 +55,12 @@ interface BranchInformationPageProps {
 export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
   onShowToast,
 }) => {
-  // 1. Active Excel Dataset (exclusive source of truth)
+  // 1. Active Dataset (initialized with default structure, synced from SQLite DB on mount)
   const [dataset, setDataset] = useState<BranchInfoDataset>(() =>
     getDefaultBranchInfoDataset()
   );
+  const [isLoadingDb, setIsLoadingDb] = useState(true);
+  const [dbError, setDbError] = useState<string | null>(null);
 
   // 2. Detail view & layout mode state
   const [selectedBranch, setSelectedBranch] = useState<BranchInfoRecord | null>(null);
@@ -59,6 +73,7 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
   // 4. Excel Upload & Preview States
   const [showImportPanel, setShowImportPanel] = useState(false);
   const [isParsingFile, setIsParsingFile] = useState(false);
+  const [isSavingImport, setIsSavingImport] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
   const [importPreview, setImportPreview] = useState<BranchInfoImportPreview | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -66,11 +81,45 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
   // 5. Copy confirmation feedback
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
+  // 6. CRUD Modal States (Add / Edit / Delete Confirmation)
+  const [formModalMode, setFormModalMode] = useState<'add' | 'edit' | null>(null);
+  const [editingRecord, setEditingRecord] = useState<BranchInfoRecord | null>(null);
+  const [formFields, setFormFields] = useState<Record<string, string>>({});
+  const [formFieldErrors, setFormFieldErrors] = useState<Record<string, string>>({});
+  const [formGeneralError, setFormGeneralError] = useState<string | null>(null);
+  const [isSubmittingForm, setIsSubmittingForm] = useState(false);
+
+  const [deletingRecord, setDeletingRecord] = useState<BranchInfoRecord | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
+
   const notify = (msg: string) => {
     if (onShowToast) {
       onShowToast(msg);
     }
   };
+
+  // Load persisted Branch Information from database on mount
+  const loadFromDatabase = async (showSuccessToast = false) => {
+    setIsLoadingDb(true);
+    setDbError(null);
+    try {
+      const dbData = await fetchBranchInfoDataset();
+      setDataset(dbData);
+      if (showSuccessToast) {
+        notify(`Refreshed ${dbData.records.length} branch records from database`);
+      }
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : 'Unable to load branch information from database.';
+      setDbError(msg);
+    } finally {
+      setIsLoadingDb(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadFromDatabase(false);
+  }, []);
 
   const handleCopyText = async (text: string, key: string, toastMsg: string) => {
     try {
@@ -177,6 +226,237 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
     });
   }, [dataset.records, dataset.columns, dataset.filterConfigs, cols.phoneCol, searchQuery, columnFilters]);
 
+  // =========================================================
+  // CRUD HANDLERS (Add, Edit, Delete with Form Validation)
+  // =========================================================
+  const getNextSuggestedSn = (): string => {
+    if (!cols.snCol) return '';
+    let maxSn = 0;
+    dataset.records.forEach((r) => {
+      const raw = (r.fields[cols.snCol!] || '').trim();
+      if (/^\d+$/.test(raw)) {
+        const n = parseInt(raw, 10);
+        if (n > maxSn) maxSn = n;
+      }
+    });
+    return String(maxSn + 1);
+  };
+
+  const openAddModal = () => {
+    const initial: Record<string, string> = {};
+    dataset.columns.forEach((c) => {
+      initial[c] = c === cols.snCol ? getNextSuggestedSn() : '';
+    });
+    setFormFields(initial);
+    setFormFieldErrors({});
+    setFormGeneralError(null);
+    setEditingRecord(null);
+    setFormModalMode('add');
+  };
+
+  const openEditModal = (record: BranchInfoRecord) => {
+    const initial: Record<string, string> = {};
+    dataset.columns.forEach((c) => {
+      initial[c] = record.fields[c] ?? '';
+    });
+    setFormFields(initial);
+    setFormFieldErrors({});
+    setFormGeneralError(null);
+    setEditingRecord(record);
+    setFormModalMode('edit');
+  };
+
+  const closeFormModal = () => {
+    if (isSubmittingForm) return;
+    setFormModalMode(null);
+    setEditingRecord(null);
+    setFormFieldErrors({});
+    setFormGeneralError(null);
+  };
+
+  const validateBranchFormClient = (
+    values: Record<string, string>,
+    excludeRowKey?: string
+  ): Record<string, string> => {
+    const errs: Record<string, string> = {};
+    const branchNameCol = cols.branchNameCol || dataset.columns[1] || dataset.columns[0];
+
+    if (branchNameCol) {
+      const nameVal = (values[branchNameCol] || '').trim();
+      if (!nameVal) {
+        errs[branchNameCol] = `${branchNameCol} is required.`;
+      } else if (nameVal.length < 2) {
+        errs[branchNameCol] = `${branchNameCol} must be at least 2 characters.`;
+      } else {
+        const duplicateName = dataset.records.find(
+          (r) =>
+            r._rowKey !== excludeRowKey &&
+            (r.fields[branchNameCol] || '').trim().toLowerCase() === nameVal.toLowerCase()
+        );
+        if (duplicateName) {
+          errs[branchNameCol] = `Branch "${nameVal}" already exists.`;
+        }
+      }
+    }
+
+    if (cols.snCol) {
+      const snVal = (values[cols.snCol] || '').trim();
+      if (snVal) {
+        if (!/^[a-zA-Z0-9_-]{1,20}$/.test(snVal)) {
+          errs[cols.snCol] = `${cols.snCol} must be alphanumeric or numeric.`;
+        } else {
+          const duplicateSn = dataset.records.find(
+            (r) =>
+              r._rowKey !== excludeRowKey &&
+              (r.fields[cols.snCol!] || '').trim().toLowerCase() === snVal.toLowerCase()
+          );
+          if (duplicateSn) {
+            errs[cols.snCol] = `${cols.snCol} "${snVal}" is already assigned to another branch.`;
+          }
+        }
+      }
+    }
+
+    if (cols.phoneCol) {
+      const phoneVal = (values[cols.phoneCol] || '').trim();
+      if (phoneVal) {
+        const digits = phoneVal.replace(/\D/g, '');
+        if (!/^[+\d\s()/-]{7,30}$/.test(phoneVal) || digits.length < 7 || digits.length > 15) {
+          errs[cols.phoneCol] = `Enter a valid ${cols.phoneCol.toLowerCase()} (7–15 digits).`;
+        }
+      }
+    }
+
+    if (cols.emailCol) {
+      const emailVal = (values[cols.emailCol] || '').trim();
+      if (emailVal && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailVal)) {
+        errs[cols.emailCol] = 'Enter a valid email address.';
+      }
+    }
+
+    if (cols.mapLinkCol) {
+      const mapVal = (values[cols.mapLinkCol] || '').trim();
+      if (
+        mapVal &&
+        !/^https?:\/\/\S+$/i.test(mapVal) &&
+        !/^-?\d{1,2}\.\d+\s*,\s*-?\d{1,3}\.\d+$/.test(mapVal)
+      ) {
+        errs[cols.mapLinkCol] =
+          'Enter a valid http(s) Maps URL or coordinates (e.g. 25.1234, 55.1234).';
+      }
+    }
+
+    const locationOrAddressCol = cols.locationCol || cols.addressCol;
+    if (locationOrAddressCol && !(values[locationOrAddressCol] || '').trim()) {
+      errs[locationOrAddressCol] = `${locationOrAddressCol} is required.`;
+    }
+
+    return errs;
+  };
+
+  const handleSubmitForm = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed: Record<string, string> = {};
+    dataset.columns.forEach((c) => {
+      trimmed[c] = (formFields[c] ?? '').trim();
+    });
+
+    const clientErrors = validateBranchFormClient(
+      trimmed,
+      formModalMode === 'edit' ? editingRecord?._rowKey : undefined
+    );
+    if (Object.keys(clientErrors).length > 0) {
+      setFormFieldErrors(clientErrors);
+      setFormGeneralError(Object.values(clientErrors)[0]);
+      return;
+    }
+
+    setIsSubmittingForm(true);
+    setFormFieldErrors({});
+    setFormGeneralError(null);
+
+    try {
+      if (formModalMode === 'add') {
+        const created = await createBranchInfoRecord(trimmed);
+        setDataset((prev) => {
+          const nextRecords = [...prev.records, created];
+          return {
+            ...prev,
+            records: nextRecords,
+            filterConfigs: buildBranchFilterConfigs(
+              prev.columns,
+              nextRecords,
+              prev.detectedColumns
+            ),
+          };
+        });
+        setFormModalMode(null);
+        notify(`Added branch: ${getBranchTitle(created)}`);
+      } else if (formModalMode === 'edit' && editingRecord) {
+        const updated = await updateBranchInfoRecord(editingRecord._rowKey, trimmed);
+        setDataset((prev) => {
+          const nextRecords = prev.records.map((r) =>
+            r._rowKey === updated._rowKey ? updated : r
+          );
+          return {
+            ...prev,
+            records: nextRecords,
+            filterConfigs: buildBranchFilterConfigs(
+              prev.columns,
+              nextRecords,
+              prev.detectedColumns
+            ),
+          };
+        });
+        if (selectedBranch?._rowKey === updated._rowKey) {
+          setSelectedBranch(updated);
+        }
+        setFormModalMode(null);
+        setEditingRecord(null);
+        notify(`Updated branch: ${getBranchTitle(updated)}`);
+      }
+    } catch (err) {
+      if (err instanceof BranchApiValidationError) {
+        setFormFieldErrors(err.fieldErrors);
+        setFormGeneralError(err.message);
+      } else {
+        setFormGeneralError(err instanceof Error ? err.message : 'Unable to save branch.');
+      }
+    } finally {
+      setIsSubmittingForm(false);
+    }
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!deletingRecord) return;
+    setIsDeleting(true);
+    try {
+      await deleteBranchInfoRecord(deletingRecord._rowKey);
+      const deletedTitle = getBranchTitle(deletingRecord);
+      setDataset((prev) => {
+        const nextRecords = prev.records.filter((r) => r._rowKey !== deletingRecord._rowKey);
+        return {
+          ...prev,
+          records: nextRecords,
+          filterConfigs: buildBranchFilterConfigs(
+            prev.columns,
+            nextRecords,
+            prev.detectedColumns
+          ),
+        };
+      });
+      if (selectedBranch?._rowKey === deletingRecord._rowKey) {
+        setSelectedBranch(null);
+      }
+      setDeletingRecord(null);
+      notify(`Deleted branch: ${deletedTitle}`);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Failed to delete branch.');
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
   // Excel Upload Handler
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -201,43 +481,293 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
     }
   };
 
-  const handleConfirmImport = () => {
+  const handleConfirmImport = async () => {
     if (!importPreview) return;
-
-    setDataset({
-      fileName: importPreview.fileName,
-      sheetNames: importPreview.sheetNames,
-      columns: importPreview.columns,
-      detectedColumns: importPreview.detectedColumns,
-      filterConfigs: importPreview.filterConfigs,
-      records: importPreview.records,
-      notes: importPreview.notes,
-      isDefaultSource: false,
-      importedAt: new Date().toLocaleTimeString([], {
-        hour: '2-digit',
-        minute: '2-digit',
-      }),
-    });
-
-    setSelectedBranch(null);
-    handleClearFilters();
-    setImportPreview(null);
+    setIsSavingImport(true);
     setImportError(null);
-    setShowImportPanel(false);
-    notify(
-      `Imported ${importPreview.records.length} branch records from ${importPreview.fileName}`
-    );
+
+    try {
+      const savedDataset = await saveImportedBranchInfoDataset({
+        fileName: importPreview.fileName,
+        sheetNames: importPreview.sheetNames,
+        columns: importPreview.columns,
+        detectedColumns: importPreview.detectedColumns,
+        records: importPreview.records,
+        notes: importPreview.notes,
+        importedAt: new Date().toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+        }),
+      });
+
+      setDataset(savedDataset);
+      setSelectedBranch(null);
+      handleClearFilters();
+      setImportPreview(null);
+      setImportError(null);
+      setShowImportPanel(false);
+      notify(
+        `Saved ${savedDataset.records.length} branch records from ${savedDataset.fileName} to database`
+      );
+    } catch (err) {
+      setImportError(
+        err instanceof Error ? err.message : 'Failed to save imported branch records to database.'
+      );
+    } finally {
+      setIsSavingImport(false);
+    }
   };
 
-  const handleRefreshData = () => {
-    const def = getDefaultBranchInfoDataset();
-    setDataset(def);
-    setSelectedBranch(null);
-    handleClearFilters();
-    setImportPreview(null);
-    setImportError(null);
-    notify('Refreshed Branch Information from source file');
+  const isBranchFieldRequired = (col: string): boolean => {
+    const branchNameCol = cols.branchNameCol || dataset.columns[1] || dataset.columns[0];
+    const locationOrAddressCol = cols.locationCol || cols.addressCol;
+    return col === branchNameCol || col === locationOrAddressCol;
   };
+
+  // =========================================================
+  // SHARED MODALS (Add/Edit + Delete Confirmation)
+  // =========================================================
+  const renderModals = () => (
+    <>
+      {/* Add / Edit Branch Modal */}
+      {formModalMode && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-900/60 dark:bg-black/75 backdrop-blur-xs flex items-center justify-center p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="branch-form-modal-title"
+        >
+          <div className="bg-white dark:bg-[#0F172A] rounded-2xl border border-[#E2E8F0] dark:border-slate-700 shadow-2xl max-w-2xl w-full max-h-[90vh] flex flex-col overflow-hidden">
+            <div className="bg-[#064E3B] dark:bg-[#043427] text-white px-5 py-4 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-white/10 border border-white/20 flex items-center justify-center shrink-0">
+                  {formModalMode === 'add' ? (
+                    <Plus className="w-5 h-5 text-emerald-300" />
+                  ) : (
+                    <Pencil className="w-4 h-4 text-emerald-300" />
+                  )}
+                </div>
+                <div>
+                  <h3 id="branch-form-modal-title" className="text-base font-extrabold">
+                    {formModalMode === 'add' ? 'Add New Branch' : 'Edit Branch Information'}
+                  </h3>
+                  <p className="text-[11px] text-emerald-100/80">
+                    {formModalMode === 'add'
+                      ? 'Create a new Eco Drive branch record and persist it to the database.'
+                      : 'Update branch details and save changes to the database.'}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={closeFormModal}
+                disabled={isSubmittingForm}
+                className="p-2 rounded-xl bg-white/10 hover:bg-white/20 text-white transition-colors"
+                aria-label="Close modal"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSubmitForm} className="flex flex-col flex-1 overflow-hidden">
+              <div className="p-5 overflow-y-auto space-y-4">
+                {formGeneralError && (
+                  <div
+                    role="alert"
+                    className="p-3 rounded-xl bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-800 text-rose-800 dark:text-rose-200 text-xs flex items-start gap-2"
+                  >
+                    <AlertCircle className="w-4 h-4 text-rose-600 dark:text-rose-400 shrink-0 mt-0.5" />
+                    <span>{formGeneralError}</span>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  {dataset.columns.map((col) => {
+                    const required = isBranchFieldRequired(col);
+                    const error = formFieldErrors[col];
+                    const isWide =
+                      col === cols.locationCol ||
+                      col === cols.addressCol ||
+                      col === cols.branchNameCol ||
+                      col === cols.mapLinkCol;
+                    const isPhone = col === cols.phoneCol;
+                    const isEmail = col === cols.emailCol;
+
+                    return (
+                      <div key={col} className={isWide ? 'sm:col-span-2' : ''}>
+                        <label
+                          htmlFor={`branch-field-${col}`}
+                          className="block text-xs font-bold text-[#0F172A] dark:text-slate-200 mb-1.5"
+                        >
+                          {col}
+                          {required && <span className="text-rose-500 ml-1">*</span>}
+                        </label>
+                        {col === cols.locationCol || col === cols.addressCol ? (
+                          <textarea
+                            id={`branch-field-${col}`}
+                            rows={2}
+                            value={formFields[col] ?? ''}
+                            onChange={(e) => {
+                              const nextVal = e.target.value;
+                              setFormFields((prev) => ({ ...prev, [col]: nextVal }));
+                              if (formFieldErrors[col]) {
+                                setFormFieldErrors((prev) => {
+                                  const copy = { ...prev };
+                                  delete copy[col];
+                                  return copy;
+                                });
+                              }
+                            }}
+                            placeholder={`Enter ${col}...`}
+                            className={`w-full px-3.5 py-2.5 text-xs sm:text-sm rounded-xl border transition-all focus:outline-none focus:ring-2 ${
+                              error
+                                ? 'bg-rose-50/50 dark:bg-rose-950/30 border-rose-400 dark:border-rose-700 text-[#0F172A] dark:text-slate-100 focus:ring-rose-500'
+                                : 'bg-[#F8FAFC] dark:bg-slate-900 border-[#CBD5E1] dark:border-slate-700 text-[#0F172A] dark:text-slate-100 placeholder-[#94A3B8] dark:placeholder-slate-500 focus:bg-white dark:focus:bg-slate-800 focus:ring-[#006B45] focus:border-[#006B45]'
+                            }`}
+                          />
+                        ) : (
+                          <input
+                            id={`branch-field-${col}`}
+                            type={isPhone ? 'tel' : isEmail ? 'email' : 'text'}
+                            value={formFields[col] ?? ''}
+                            onChange={(e) => {
+                              const nextVal = e.target.value;
+                              setFormFields((prev) => ({ ...prev, [col]: nextVal }));
+                              if (formFieldErrors[col]) {
+                                setFormFieldErrors((prev) => {
+                                  const copy = { ...prev };
+                                  delete copy[col];
+                                  return copy;
+                                });
+                              }
+                            }}
+                            placeholder={`Enter ${col}...`}
+                            className={`w-full px-3.5 py-2.5 text-xs sm:text-sm rounded-xl border transition-all focus:outline-none focus:ring-2 ${
+                              error
+                                ? 'bg-rose-50/50 dark:bg-rose-950/30 border-rose-400 dark:border-rose-700 text-[#0F172A] dark:text-slate-100 focus:ring-rose-500'
+                                : 'bg-[#F8FAFC] dark:bg-slate-900 border-[#CBD5E1] dark:border-slate-700 text-[#0F172A] dark:text-slate-100 placeholder-[#94A3B8] dark:placeholder-slate-500 focus:bg-white dark:focus:bg-slate-800 focus:ring-[#006B45] focus:border-[#006B45]'
+                            }`}
+                          />
+                        )}
+                        {error && (
+                          <p className="mt-1 text-[11px] font-semibold text-rose-600 dark:text-rose-400">
+                            {error}
+                          </p>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="px-5 py-3.5 bg-[#F8FAFC] dark:bg-slate-900/80 border-t border-[#E2E8F0] dark:border-slate-800 flex items-center justify-end gap-2.5">
+                <button
+                  type="button"
+                  onClick={closeFormModal}
+                  disabled={isSubmittingForm}
+                  className="px-4 py-2 rounded-xl bg-white dark:bg-slate-800 border border-[#CBD5E1] dark:border-slate-700 text-[#475569] dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 text-xs font-semibold transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSubmittingForm}
+                  className="inline-flex items-center gap-1.5 px-5 py-2 rounded-xl bg-[#006B45] hover:bg-[#064E3B] disabled:opacity-60 text-white text-xs font-bold shadow-xs transition-colors"
+                >
+                  {isSubmittingForm ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-300" />
+                  )}
+                  <span>
+                    {isSubmittingForm
+                      ? 'Saving...'
+                      : formModalMode === 'add'
+                      ? 'Add Branch'
+                      : 'Save Changes'}
+                  </span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Branch Confirmation Modal */}
+      {deletingRecord && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-900/60 dark:bg-black/75 backdrop-blur-xs flex items-center justify-center p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="delete-branch-title"
+        >
+          <div className="bg-white dark:bg-[#0F172A] rounded-2xl border border-[#E2E8F0] dark:border-slate-700 shadow-2xl max-w-md w-full overflow-hidden">
+            <div className="p-5 space-y-4">
+              <div className="flex items-start gap-3">
+                <div className="w-10 h-10 rounded-xl bg-rose-50 dark:bg-rose-950/60 border border-rose-200 dark:border-rose-800 text-rose-600 dark:text-rose-400 flex items-center justify-center shrink-0">
+                  <Trash2 className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3
+                    id="delete-branch-title"
+                    className="text-base font-extrabold text-[#0F172A] dark:text-slate-100"
+                  >
+                    Confirm Delete Branch
+                  </h3>
+                  <p className="text-xs text-[#64748B] dark:text-slate-400 mt-1">
+                    Are you sure you want to permanently remove this branch from the database? This action cannot be undone.
+                  </p>
+                </div>
+              </div>
+
+              <div className="bg-[#F8FAFC] dark:bg-slate-900 border border-[#E2E8F0] dark:border-slate-800 rounded-xl p-3.5 text-xs space-y-1">
+                <div className="font-extrabold text-[#0F172A] dark:text-slate-100 text-sm">
+                  {getBranchTitle(deletingRecord)}
+                </div>
+                <div className="flex flex-wrap items-center gap-3 text-[#64748B] dark:text-slate-400">
+                  {getBranchSn(deletingRecord) && (
+                    <span className="font-mono">S No. #{getBranchSn(deletingRecord)}</span>
+                  )}
+                  {getBranchPhone(deletingRecord) && (
+                    <span className="font-mono">{getBranchPhone(deletingRecord)}</span>
+                  )}
+                </div>
+                {getBranchLocation(deletingRecord) && (
+                  <div className="text-[#64748B] dark:text-slate-400 pt-0.5">
+                    {getBranchLocation(deletingRecord)}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="px-5 py-3.5 bg-[#F8FAFC] dark:bg-slate-900/80 border-t border-[#E2E8F0] dark:border-slate-800 flex items-center justify-end gap-2.5">
+              <button
+                type="button"
+                onClick={() => !isDeleting && setDeletingRecord(null)}
+                disabled={isDeleting}
+                className="px-4 py-2 rounded-xl bg-white dark:bg-slate-800 border border-[#CBD5E1] dark:border-slate-700 text-[#475569] dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 text-xs font-semibold transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleConfirmDelete()}
+                disabled={isDeleting}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 disabled:opacity-60 text-white text-xs font-bold shadow-xs transition-colors"
+              >
+                {isDeleting ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Trash2 className="w-3.5 h-3.5" />
+                )}
+                <span>{isDeleting ? 'Deleting...' : 'Delete Branch'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
 
   // =========================================================
   // BRANCH DETAILS VIEW
@@ -282,12 +812,14 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
 
     return (
       <div className="space-y-6">
+        {renderModals()}
+
         {/* Back Button & Quick Actions */}
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <button
             type="button"
             onClick={() => setSelectedBranch(null)}
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-white border border-[#CBD5E1] hover:border-[#006B45] text-[#0F172A] hover:text-[#006B45] text-xs font-bold shadow-2xs transition-colors w-max"
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-white dark:bg-slate-800 border border-[#CBD5E1] dark:border-slate-700 hover:border-[#006B45] dark:hover:border-emerald-500 text-[#0F172A] dark:text-slate-100 hover:text-[#006B45] dark:hover:text-emerald-300 text-xs font-bold shadow-2xs transition-colors w-max"
           >
             <ArrowLeft className="w-4 h-4" />
             <span>Back to Branch Information</span>
@@ -304,12 +836,12 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                     `Copied contact number: ${branchPhone}`
                   )
                 }
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-white border border-[#CBD5E1] hover:border-[#006B45] text-[#0F172A] text-xs font-semibold shadow-2xs transition-colors"
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-white dark:bg-slate-800 border border-[#CBD5E1] dark:border-slate-700 hover:border-[#006B45] text-[#0F172A] dark:text-slate-100 text-xs font-semibold shadow-2xs transition-colors"
               >
                 {copiedKey === `det-phone-${selectedBranch._rowKey}` ? (
-                  <Check className="w-3.5 h-3.5 text-emerald-600" />
+                  <Check className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
                 ) : (
-                  <Phone className="w-3.5 h-3.5 text-[#006B45]" />
+                  <Phone className="w-3.5 h-3.5 text-[#006B45] dark:text-emerald-400" />
                 )}
                 <span>Copy Contact Number</span>
               </button>
@@ -325,12 +857,12 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                     'Copied branch location'
                   )
                 }
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-white border border-[#CBD5E1] hover:border-[#006B45] text-[#0F172A] text-xs font-semibold shadow-2xs transition-colors"
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-white dark:bg-slate-800 border border-[#CBD5E1] dark:border-slate-700 hover:border-[#006B45] text-[#0F172A] dark:text-slate-100 text-xs font-semibold shadow-2xs transition-colors"
               >
                 {copiedKey === `det-loc-${selectedBranch._rowKey}` ? (
-                  <Check className="w-3.5 h-3.5 text-emerald-600" />
+                  <Check className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
                 ) : (
-                  <MapPin className="w-3.5 h-3.5 text-[#006B45]" />
+                  <MapPin className="w-3.5 h-3.5 text-[#006B45] dark:text-emerald-400" />
                 )}
                 <span>Copy Branch Address</span>
               </button>
@@ -341,13 +873,31 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                 href={mapHref}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-white border border-[#CBD5E1] hover:border-[#006B45] text-[#006B45] text-xs font-semibold shadow-2xs transition-colors"
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-white dark:bg-slate-800 border border-[#CBD5E1] dark:border-slate-700 hover:border-[#006B45] text-[#006B45] dark:text-emerald-400 text-xs font-semibold shadow-2xs transition-colors"
               >
                 <MapPin className="w-3.5 h-3.5" />
                 <span>Open in Google Maps</span>
-                <ExternalLink className="w-3 h-3 text-[#64748B]" />
+                <ExternalLink className="w-3 h-3 text-[#64748B] dark:text-slate-400" />
               </a>
             )}
+
+            <button
+              type="button"
+              onClick={() => openEditModal(selectedBranch)}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-white dark:bg-slate-800 border border-[#CBD5E1] dark:border-slate-700 hover:border-[#006B45] text-[#0F172A] dark:text-slate-100 text-xs font-semibold shadow-2xs transition-colors"
+            >
+              <Pencil className="w-3.5 h-3.5 text-[#006B45] dark:text-emerald-400" />
+              <span>Edit</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setDeletingRecord(selectedBranch)}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-800 hover:bg-rose-100 dark:hover:bg-rose-900/60 text-rose-700 dark:text-rose-300 text-xs font-semibold shadow-2xs transition-colors"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>Delete</span>
+            </button>
 
             <button
               type="button"
@@ -371,7 +921,7 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
         </div>
 
         {/* Branch Profile Header Card */}
-        <div className="bg-white rounded-2xl border border-[#E2E8F0] shadow-xs overflow-hidden">
+        <div className="bg-white dark:bg-[#0F172A] rounded-2xl border border-[#E2E8F0] dark:border-slate-800 shadow-xs overflow-hidden">
           <div className="bg-gradient-to-r from-[#064E3B] to-[#006B45] text-white p-5 sm:p-6">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <div className="flex items-start sm:items-center gap-4">
@@ -405,7 +955,7 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
             {/* General Information */}
             {generalCols.length > 0 && (
               <div>
-                <h3 className="text-xs font-extrabold uppercase tracking-wider text-[#006B45] mb-3 flex items-center gap-1.5">
+                <h3 className="text-xs font-extrabold uppercase tracking-wider text-[#006B45] dark:text-emerald-400 mb-3 flex items-center gap-1.5">
                   <Building2 className="w-4 h-4" />
                   <span>General Information</span>
                 </h3>
@@ -413,16 +963,16 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                   {generalCols.map((col) => (
                     <div
                       key={col}
-                      className="bg-[#F8FAFC] border border-[#E2E8F0] rounded-xl p-3.5"
+                      className="bg-[#F8FAFC] dark:bg-slate-900 border border-[#E2E8F0] dark:border-slate-800 rounded-xl p-3.5"
                     >
-                      <span className="block text-[10px] font-bold uppercase tracking-wider text-[#64748B]">
+                      <span className="block text-[10px] font-bold uppercase tracking-wider text-[#64748B] dark:text-slate-400">
                         {col}
                       </span>
                       <span
                         className={`mt-1 block text-sm font-bold ${
                           isEmpty(selectedBranch.fields[col])
-                            ? 'text-[#94A3B8] italic font-medium'
-                            : 'text-[#0F172A]'
+                            ? 'text-[#94A3B8] dark:text-slate-500 italic font-medium'
+                            : 'text-[#0F172A] dark:text-slate-100'
                         }`}
                       >
                         {formatValue(selectedBranch.fields[col])}
@@ -436,7 +986,7 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
             {/* Contact Information */}
             {contactCols.length > 0 && (
               <div>
-                <h3 className="text-xs font-extrabold uppercase tracking-wider text-[#006B45] mb-3 flex items-center gap-1.5">
+                <h3 className="text-xs font-extrabold uppercase tracking-wider text-[#006B45] dark:text-emerald-400 mb-3 flex items-center gap-1.5">
                   <Phone className="w-4 h-4" />
                   <span>Contact Information</span>
                 </h3>
@@ -446,17 +996,17 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                     return (
                       <div
                         key={col}
-                        className="bg-[#F0FDF4] border border-[#D1FAE5] rounded-xl p-3.5 flex items-center justify-between gap-3"
+                        className="bg-[#F0FDF4] dark:bg-emerald-950/40 border border-[#D1FAE5] dark:border-emerald-800/60 rounded-xl p-3.5 flex items-center justify-between gap-3"
                       >
                         <div>
-                          <span className="block text-[10px] font-bold uppercase tracking-wider text-[#064E3B]/70">
+                          <span className="block text-[10px] font-bold uppercase tracking-wider text-[#064E3B]/70 dark:text-emerald-300/80">
                             {col}
                           </span>
                           <span
                             className={`mt-1 block text-sm font-extrabold ${
                               val
-                                ? 'text-[#064E3B] font-mono'
-                                : 'text-[#94A3B8] italic font-medium'
+                                ? 'text-[#064E3B] dark:text-emerald-200 font-mono'
+                                : 'text-[#94A3B8] dark:text-slate-500 italic font-medium'
                             }`}
                           >
                             {formatValue(val)}
@@ -468,11 +1018,11 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                             onClick={() =>
                               handleCopyText(val, `cc-${col}`, `Copied ${col}: ${val}`)
                             }
-                            className="p-2 rounded-lg bg-white border border-[#D1FAE5] hover:border-[#006B45] text-[#006B45] transition-colors shrink-0"
+                            className="p-2 rounded-lg bg-white dark:bg-slate-800 border border-[#D1FAE5] dark:border-emerald-800 hover:border-[#006B45] text-[#006B45] dark:text-emerald-400 transition-colors shrink-0"
                             title={`Copy ${col}`}
                           >
                             {copiedKey === `cc-${col}` ? (
-                              <Check className="w-4 h-4 text-emerald-600" />
+                              <Check className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
                             ) : (
                               <Copy className="w-4 h-4" />
                             )}
@@ -488,7 +1038,7 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
             {/* Location Details */}
             {locationCols.length > 0 && (
               <div>
-                <h3 className="text-xs font-extrabold uppercase tracking-wider text-[#006B45] mb-3 flex items-center gap-1.5">
+                <h3 className="text-xs font-extrabold uppercase tracking-wider text-[#006B45] dark:text-emerald-400 mb-3 flex items-center gap-1.5">
                   <MapPin className="w-4 h-4" />
                   <span>Location Details</span>
                 </h3>
@@ -498,15 +1048,17 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                     return (
                       <div
                         key={col}
-                        className="bg-[#F8FAFC] border border-[#E2E8F0] rounded-xl p-4 flex items-start justify-between gap-3"
+                        className="bg-[#F8FAFC] dark:bg-slate-900 border border-[#E2E8F0] dark:border-slate-800 rounded-xl p-4 flex items-start justify-between gap-3"
                       >
                         <div>
-                          <span className="block text-[10px] font-bold uppercase tracking-wider text-[#64748B]">
+                          <span className="block text-[10px] font-bold uppercase tracking-wider text-[#64748B] dark:text-slate-400">
                             {col}
                           </span>
                           <span
                             className={`mt-1 block text-sm font-bold break-words ${
-                              val ? 'text-[#0F172A]' : 'text-[#94A3B8] italic font-medium'
+                              val
+                                ? 'text-[#0F172A] dark:text-slate-100'
+                                : 'text-[#94A3B8] dark:text-slate-500 italic font-medium'
                             }`}
                           >
                             {formatValue(val)}
@@ -518,11 +1070,11 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                             onClick={() =>
                               handleCopyText(val, `loc-${col}`, `Copied ${col}`)
                             }
-                            className="p-2 rounded-lg bg-white border border-[#CBD5E1] hover:border-[#006B45] text-[#64748B] hover:text-[#006B45] transition-colors shrink-0"
+                            className="p-2 rounded-lg bg-white dark:bg-slate-800 border border-[#CBD5E1] dark:border-slate-700 hover:border-[#006B45] text-[#64748B] dark:text-slate-300 hover:text-[#006B45] dark:hover:text-emerald-400 transition-colors shrink-0"
                             title={`Copy ${col}`}
                           >
                             {copiedKey === `loc-${col}` ? (
-                              <Check className="w-4 h-4 text-emerald-600" />
+                              <Check className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
                             ) : (
                               <Copy className="w-4 h-4" />
                             )}
@@ -535,10 +1087,10 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
               </div>
             )}
 
-            {/* Management Information (Only if column exists in uploaded file) */}
+            {/* Management Information */}
             {managementCols.length > 0 && (
               <div>
-                <h3 className="text-xs font-extrabold uppercase tracking-wider text-[#006B45] mb-3 flex items-center gap-1.5">
+                <h3 className="text-xs font-extrabold uppercase tracking-wider text-[#006B45] dark:text-emerald-400 mb-3 flex items-center gap-1.5">
                   <Building2 className="w-4 h-4" />
                   <span>Management Information</span>
                 </h3>
@@ -546,12 +1098,12 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                   {managementCols.map((col) => (
                     <div
                       key={col}
-                      className="bg-[#F8FAFC] border border-[#E2E8F0] rounded-xl p-3.5"
+                      className="bg-[#F8FAFC] dark:bg-slate-900 border border-[#E2E8F0] dark:border-slate-800 rounded-xl p-3.5"
                     >
-                      <span className="block text-[10px] font-bold uppercase tracking-wider text-[#64748B]">
+                      <span className="block text-[10px] font-bold uppercase tracking-wider text-[#64748B] dark:text-slate-400">
                         {col}
                       </span>
-                      <span className="mt-1 block text-sm font-bold text-[#0F172A]">
+                      <span className="mt-1 block text-sm font-bold text-[#0F172A] dark:text-slate-100">
                         {formatValue(selectedBranch.fields[col])}
                       </span>
                     </div>
@@ -560,10 +1112,10 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
               </div>
             )}
 
-            {/* Working Hours (Only if column exists in uploaded file) */}
+            {/* Working Hours */}
             {workingHoursCols.length > 0 && (
               <div>
-                <h3 className="text-xs font-extrabold uppercase tracking-wider text-[#006B45] mb-3 flex items-center gap-1.5">
+                <h3 className="text-xs font-extrabold uppercase tracking-wider text-[#006B45] dark:text-emerald-400 mb-3 flex items-center gap-1.5">
                   <Clock className="w-4 h-4" />
                   <span>Working Hours</span>
                 </h3>
@@ -571,12 +1123,12 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                   {workingHoursCols.map((col) => (
                     <div
                       key={col}
-                      className="bg-[#F8FAFC] border border-[#E2E8F0] rounded-xl p-3.5"
+                      className="bg-[#F8FAFC] dark:bg-slate-900 border border-[#E2E8F0] dark:border-slate-800 rounded-xl p-3.5"
                     >
-                      <span className="block text-[10px] font-bold uppercase tracking-wider text-[#64748B]">
+                      <span className="block text-[10px] font-bold uppercase tracking-wider text-[#64748B] dark:text-slate-400">
                         {col}
                       </span>
-                      <span className="mt-1 block text-sm font-bold text-[#0F172A]">
+                      <span className="mt-1 block text-sm font-bold text-[#0F172A] dark:text-slate-100">
                         {formatValue(selectedBranch.fields[col])}
                       </span>
                     </div>
@@ -585,10 +1137,10 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
               </div>
             )}
 
-            {/* Additional Information (Any other Excel columns) */}
+            {/* Additional Information */}
             {additionalCols.length > 0 && (
               <div>
-                <h3 className="text-xs font-extrabold uppercase tracking-wider text-[#006B45] mb-3 flex items-center gap-1.5">
+                <h3 className="text-xs font-extrabold uppercase tracking-wider text-[#006B45] dark:text-emerald-400 mb-3 flex items-center gap-1.5">
                   <Info className="w-4 h-4" />
                   <span>Additional Information</span>
                 </h3>
@@ -596,12 +1148,12 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                   {additionalCols.map((col) => (
                     <div
                       key={col}
-                      className="bg-[#F8FAFC] border border-[#E2E8F0] rounded-xl p-3.5"
+                      className="bg-[#F8FAFC] dark:bg-slate-900 border border-[#E2E8F0] dark:border-slate-800 rounded-xl p-3.5"
                     >
-                      <span className="block text-[10px] font-bold uppercase tracking-wider text-[#64748B]">
+                      <span className="block text-[10px] font-bold uppercase tracking-wider text-[#64748B] dark:text-slate-400">
                         {col}
                       </span>
-                      <span className="mt-1 block text-sm font-bold text-[#0F172A] break-words">
+                      <span className="mt-1 block text-sm font-bold text-[#0F172A] dark:text-slate-100 break-words">
                         {formatValue(selectedBranch.fields[col])}
                       </span>
                     </div>
@@ -620,6 +1172,25 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
   // =========================================================
   return (
     <div className="space-y-6">
+      {renderModals()}
+
+      {/* Database Error Banner if any */}
+      {dbError && (
+        <div className="p-3.5 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 text-amber-900 dark:text-amber-200 text-xs flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0" />
+            <span>{dbError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => void loadFromDatabase(true)}
+            className="px-3 py-1 rounded-lg bg-amber-600 text-white font-semibold hover:bg-amber-700 shrink-0"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
       {/* 1. Source Banner & Quick Actions Header */}
       <div className="bg-gradient-to-r from-[#064E3B] to-[#006B45] text-white rounded-2xl p-4 sm:p-5 shadow-sm border border-emerald-400/20">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
@@ -630,8 +1201,8 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
             <div>
               <div className="flex flex-wrap items-center gap-2">
                 <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-emerald-400/20 text-emerald-200 border border-emerald-400/30">
-                  <FileSpreadsheet className="w-3 h-3" />
-                  Excel Source Active
+                  <Database className="w-3 h-3" />
+                  Database Active
                 </span>
                 <span className="text-[11px] text-emerald-100/80 font-medium">
                   {dataset.sheetNames.length} worksheet{dataset.sheetNames.length > 1 ? 's' : ''} · {dataset.columns.length} columns · {dataset.records.length} branches
@@ -645,6 +1216,15 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
 
           {/* Quick Actions */}
           <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={openAddModal}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-white text-[#064E3B] hover:bg-emerald-50 text-xs font-extrabold shadow-xs transition-colors"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>Add Branch</span>
+            </button>
+
             <button
               type="button"
               onClick={() => {
@@ -685,11 +1265,12 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
 
             <button
               type="button"
-              onClick={handleRefreshData}
+              onClick={() => void loadFromDatabase(true)}
+              disabled={isLoadingDb}
               className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-black/25 hover:bg-black/35 text-emerald-100 text-xs font-semibold border border-white/10 transition-colors"
-              title="Refresh branch data from source file"
+              title="Refresh branch data from database"
             >
-              <RefreshCw className="w-3.5 h-3.5 text-emerald-300" />
+              <RefreshCw className={`w-3.5 h-3.5 text-emerald-300 ${isLoadingDb ? 'animate-spin' : ''}`} />
               <span>Refresh Branch Data</span>
             </button>
           </div>
@@ -698,18 +1279,18 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
 
       {/* 2. Excel Upload & Diff Preview Panel */}
       {showImportPanel && (
-        <div className="bg-white rounded-2xl border-2 border-[#006B45]/30 p-5 shadow-sm space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-[#E2E8F0] pb-3">
+        <div className="bg-white dark:bg-[#0F172A] rounded-2xl border-2 border-[#006B45]/30 dark:border-emerald-700/50 p-5 shadow-sm space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-[#E2E8F0] dark:border-slate-800 pb-3">
             <div className="flex items-center gap-2.5">
-              <div className="w-9 h-9 rounded-xl bg-[#F0FDF4] text-[#006B45] border border-[#D1FAE5] flex items-center justify-center shrink-0">
+              <div className="w-9 h-9 rounded-xl bg-[#F0FDF4] dark:bg-emerald-950/60 text-[#006B45] dark:text-emerald-400 border border-[#D1FAE5] dark:border-emerald-800/70 flex items-center justify-center shrink-0">
                 <FileSpreadsheet className="w-5 h-5" />
               </div>
               <div>
-                <h3 className="text-sm font-extrabold text-[#0F172A]">
+                <h3 className="text-sm font-extrabold text-[#0F172A] dark:text-slate-100">
                   Upload Updated Branch Information Excel / CSV
                 </h3>
-                <p className="text-xs text-[#64748B]">
-                  Reads all worksheets (.xlsx, .xls, .csv), rebuilds filters from its columns, and previews changes before applying.
+                <p className="text-xs text-[#64748B] dark:text-slate-400">
+                  Reads all worksheets (.xlsx, .xls, .csv), rebuilds filters from its columns, and previews changes before saving to the database.
                 </p>
               </div>
             </div>
@@ -721,7 +1302,7 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                 setImportError(null);
                 setImportPreview(null);
               }}
-              className="p-1.5 rounded-lg text-[#64748B] hover:text-[#0F172A] hover:bg-slate-100 self-end sm:self-auto"
+              className="p-1.5 rounded-lg text-[#64748B] dark:text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800 self-end sm:self-auto"
             >
               <X className="w-4 h-4" />
             </button>
@@ -738,16 +1319,16 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
             />
             <label
               htmlFor="branch-info-excel-upload"
-              className="cursor-pointer border-2 border-dashed border-[#CBD5E1] hover:border-[#006B45] bg-[#F8FAFC] hover:bg-[#F0FDF4]/50 rounded-xl p-4 flex items-center justify-center gap-3 transition-colors"
+              className="cursor-pointer border-2 border-dashed border-[#CBD5E1] dark:border-slate-700 hover:border-[#006B45] dark:hover:border-emerald-500 bg-[#F8FAFC] dark:bg-slate-900 hover:bg-[#F0FDF4]/50 dark:hover:bg-emerald-950/30 rounded-xl p-4 flex items-center justify-center gap-3 transition-colors"
             >
-              <Upload className="w-5 h-5 text-[#006B45] shrink-0" />
+              <Upload className="w-5 h-5 text-[#006B45] dark:text-emerald-400 shrink-0" />
               <div className="text-xs">
-                <span className="font-bold text-[#0F172A] block">
+                <span className="font-bold text-[#0F172A] dark:text-slate-100 block">
                   {isParsingFile
                     ? 'Reading worksheets and analyzing branch records...'
                     : 'Click to select an Excel (.xlsx, .xls) or CSV file'}
                 </span>
-                <span className="text-[#64748B]">
+                <span className="text-[#64748B] dark:text-slate-400">
                   Preserves exact column headers, contact numbers, and locations
                 </span>
               </div>
@@ -755,8 +1336,8 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
           </div>
 
           {importError && (
-            <div className="p-3.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs flex items-start gap-2.5">
-              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+            <div className="p-3.5 rounded-xl bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-800 text-rose-800 dark:text-rose-200 text-xs flex items-start gap-2.5">
+              <AlertCircle className="w-4 h-4 text-rose-600 dark:text-rose-400 shrink-0 mt-0.5" />
               <div>
                 <span className="font-bold block">Import Validation Failed</span>
                 <span>{importError}</span>
@@ -765,14 +1346,14 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
           )}
 
           {importPreview && (
-            <div className="bg-[#F8FAFC] border border-[#E2E8F0] rounded-xl p-4 space-y-4">
+            <div className="bg-[#F8FAFC] dark:bg-slate-900 border border-[#E2E8F0] dark:border-slate-800 rounded-xl p-4 space-y-4">
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
                 <div>
-                  <div className="flex items-center gap-2 text-xs font-extrabold text-[#064E3B]">
-                    <CheckCircle2 className="w-4 h-4 text-[#006B45]" />
+                  <div className="flex items-center gap-2 text-xs font-extrabold text-[#064E3B] dark:text-emerald-300">
+                    <CheckCircle2 className="w-4 h-4 text-[#006B45] dark:text-emerald-400" />
                     <span>Preview Ready: {importPreview.fileName}</span>
                   </div>
-                  <p className="text-[11px] text-[#64748B] mt-0.5">
+                  <p className="text-[11px] text-[#64748B] dark:text-slate-400 mt-0.5">
                     {importPreview.records.length} branches across{' '}
                     {importPreview.sheetNames.length} worksheet(s) ({importPreview.sheetNames.join(', ')})
                   </p>
@@ -782,71 +1363,81 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                   <button
                     type="button"
                     onClick={() => setImportPreview(null)}
-                    className="px-3.5 py-2 rounded-xl bg-white border border-[#CBD5E1] text-[#64748B] hover:text-[#0F172A] text-xs font-semibold"
+                    disabled={isSavingImport}
+                    className="px-3.5 py-2 rounded-xl bg-white dark:bg-slate-800 border border-[#CBD5E1] dark:border-slate-700 text-[#64748B] dark:text-slate-300 hover:text-[#0F172A] dark:hover:text-slate-100 text-xs font-semibold"
                   >
                     Cancel
                   </button>
                   <button
                     type="button"
-                    onClick={handleConfirmImport}
-                    className="px-4 py-2 rounded-xl bg-[#006B45] hover:bg-[#064E3B] text-white text-xs font-bold shadow-xs flex items-center gap-1.5"
+                    onClick={() => void handleConfirmImport()}
+                    disabled={isSavingImport}
+                    className="px-4 py-2 rounded-xl bg-[#006B45] hover:bg-[#064E3B] disabled:opacity-60 text-white text-xs font-bold shadow-xs flex items-center gap-1.5"
                   >
-                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-300" />
-                    <span>Confirm Import ({importPreview.records.length} Records)</span>
+                    {isSavingImport ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-300" />
+                    )}
+                    <span>
+                      {isSavingImport
+                        ? 'Saving to Database...'
+                        : `Confirm Import (${importPreview.records.length} Records)`}
+                    </span>
                   </button>
                 </div>
               </div>
 
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
-                <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-2.5">
-                  <span className="text-[10px] font-bold uppercase text-emerald-700 block">
+                <div className="bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/60 rounded-lg p-2.5">
+                  <span className="text-[10px] font-bold uppercase text-emerald-700 dark:text-emerald-300 block">
                     New Records
                   </span>
-                  <span className="font-extrabold text-emerald-900 text-sm">
+                  <span className="font-extrabold text-emerald-900 dark:text-emerald-100 text-sm">
                     {importPreview.diff.newRecords}
                   </span>
                 </div>
-                <div className="bg-amber-50 border border-amber-200 rounded-lg p-2.5">
-                  <span className="text-[10px] font-bold uppercase text-amber-700 block">
+                <div className="bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 rounded-lg p-2.5">
+                  <span className="text-[10px] font-bold uppercase text-amber-700 dark:text-amber-300 block">
                     Updated Records
                   </span>
-                  <span className="font-extrabold text-amber-900 text-sm">
+                  <span className="font-extrabold text-amber-900 dark:text-amber-100 text-sm">
                     {importPreview.diff.updatedRecords}
                   </span>
                 </div>
-                <div className="bg-white border border-[#E2E8F0] rounded-lg p-2.5">
-                  <span className="text-[10px] font-bold uppercase text-[#64748B] block">
+                <div className="bg-white dark:bg-slate-800 border border-[#E2E8F0] dark:border-slate-700 rounded-lg p-2.5">
+                  <span className="text-[10px] font-bold uppercase text-[#64748B] dark:text-slate-400 block">
                     Unchanged
                   </span>
-                  <span className="font-extrabold text-[#0F172A] text-sm">
+                  <span className="font-extrabold text-[#0F172A] dark:text-slate-100 text-sm">
                     {importPreview.diff.unchangedRecords}
                   </span>
                 </div>
-                <div className="bg-rose-50 border border-rose-200 rounded-lg p-2.5">
-                  <span className="text-[10px] font-bold uppercase text-rose-700 block">
+                <div className="bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/60 rounded-lg p-2.5">
+                  <span className="text-[10px] font-bold uppercase text-rose-700 dark:text-rose-300 block">
                     Duplicates Skipped
                   </span>
-                  <span className="font-extrabold text-rose-900 text-sm">
+                  <span className="font-extrabold text-rose-900 dark:text-rose-100 text-sm">
                     {importPreview.diff.duplicatesRemoved}
                   </span>
                 </div>
               </div>
 
               {importPreview.warnings.length > 0 && (
-                <div className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-amber-900 text-[11px] space-y-1">
+                <div className="p-3 rounded-lg bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 text-amber-900 dark:text-amber-200 text-[11px] space-y-1">
                   {importPreview.warnings.map((w, i) => (
                     <div key={i} className="flex items-center gap-1.5">
-                      <Info className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                      <Info className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400 shrink-0" />
                       <span>{w}</span>
                     </div>
                   ))}
                 </div>
               )}
 
-              <div className="overflow-x-auto bg-white rounded-lg border border-[#E2E8F0]">
+              <div className="overflow-x-auto bg-white dark:bg-[#0F172A] rounded-lg border border-[#E2E8F0] dark:border-slate-800">
                 <table className="w-full text-left text-[11px]">
                   <thead>
-                    <tr className="bg-slate-50 border-b border-[#E2E8F0] text-[#475569] font-bold">
+                    <tr className="bg-slate-50 dark:bg-slate-800/80 border-b border-[#E2E8F0] dark:border-slate-700 text-[#475569] dark:text-slate-300 font-bold">
                       {importPreview.columns.map((col) => (
                         <th key={col} className="py-2 px-3 whitespace-nowrap">
                           {col}
@@ -854,15 +1445,19 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                       ))}
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-[#E2E8F0]">
+                  <tbody className="divide-y divide-[#E2E8F0] dark:divide-slate-800">
                     {importPreview.records.slice(0, 5).map((row) => (
                       <tr key={row._rowKey}>
                         {importPreview.columns.map((col) => (
                           <td key={col} className="py-2 px-3 whitespace-nowrap">
                             {isEmpty(row.fields[col]) ? (
-                              <span className="text-[#94A3B8] italic">Not Available</span>
+                              <span className="text-[#94A3B8] dark:text-slate-500 italic">
+                                Not Available
+                              </span>
                             ) : (
-                              <span className="text-[#0F172A]">{row.fields[col]}</span>
+                              <span className="text-[#0F172A] dark:text-slate-200">
+                                {row.fields[col]}
+                              </span>
                             )}
                           </td>
                         ))}
@@ -872,10 +1467,10 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                 </table>
               </div>
 
-              <p className="text-[11px] text-[#64748B] flex items-center gap-1.5">
-                <Info className="w-3.5 h-3.5 text-[#006B45] shrink-0" />
+              <p className="text-[11px] text-[#64748B] dark:text-slate-400 flex items-center gap-1.5">
+                <Info className="w-3.5 h-3.5 text-[#006B45] dark:text-emerald-400 shrink-0" />
                 <span>
-                  Confirming updates the active session view with this file&apos;s data (changes are not permanently stored in a remote database).
+                  Confirming saves these branch records directly to the persistent database.
                 </span>
               </p>
             </div>
@@ -883,32 +1478,35 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
         </div>
       )}
 
-      {/* 3. Dynamic Branch Information Filters (Built strictly from active Excel columns) */}
-      <div className="bg-white rounded-2xl border border-[#E2E8F0] p-4 sm:p-5 shadow-xs space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-[#E2E8F0] pb-3">
+      {/* 3. Dynamic Branch Information Filters */}
+      <div className="bg-white dark:bg-[#0F172A] rounded-2xl border border-[#E2E8F0] dark:border-slate-800 p-4 sm:p-5 shadow-xs space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-[#E2E8F0] dark:border-slate-800 pb-3">
           <div className="flex items-center gap-2">
-            <div className="w-7 h-7 rounded-lg bg-[#F0FDF4] text-[#006B45] flex items-center justify-center border border-[#D1FAE5]">
+            <div className="w-7 h-7 rounded-lg bg-[#F0FDF4] dark:bg-emerald-950/60 text-[#006B45] dark:text-emerald-400 flex items-center justify-center border border-[#D1FAE5] dark:border-emerald-800/70">
               <Filter className="w-4 h-4" />
             </div>
-            <h3 className="text-sm font-bold text-[#0F172A]">
+            <h3 className="text-sm font-bold text-[#0F172A] dark:text-slate-100">
               Search &amp; Filter Branch Information
             </h3>
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
-            <span className="text-xs font-semibold text-[#64748B]">
-              Showing <strong className="text-[#0F172A]">{filteredBranches.length}</strong> of{' '}
-              {dataset.records.length} branches
+            <span className="text-xs font-semibold text-[#64748B] dark:text-slate-400">
+              Showing{' '}
+              <strong className="text-[#0F172A] dark:text-slate-100">
+                {filteredBranches.length}
+              </strong>{' '}
+              of {dataset.records.length} branches
             </span>
 
-            <div className="inline-flex items-center bg-[#F8FAFC] border border-[#E2E8F0] rounded-lg p-0.5">
+            <div className="inline-flex items-center bg-[#F8FAFC] dark:bg-slate-900 border border-[#E2E8F0] dark:border-slate-700 rounded-lg p-0.5">
               <button
                 type="button"
                 onClick={() => setViewMode('cards')}
                 className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-semibold transition-colors ${
                   viewMode === 'cards'
                     ? 'bg-[#006B45] text-white'
-                    : 'text-[#64748B] hover:text-[#0F172A]'
+                    : 'text-[#64748B] dark:text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-100'
                 }`}
               >
                 <LayoutGrid className="w-3.5 h-3.5" />
@@ -920,7 +1518,7 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                 className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-semibold transition-colors ${
                   viewMode === 'table'
                     ? 'bg-[#006B45] text-white'
-                    : 'text-[#64748B] hover:text-[#0F172A]'
+                    : 'text-[#64748B] dark:text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-100'
                 }`}
               >
                 <Table2 className="w-3.5 h-3.5" />
@@ -932,9 +1530,9 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
               <button
                 type="button"
                 onClick={handleClearFilters}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-[#64748B] hover:text-[#0F172A] bg-slate-100 hover:bg-slate-200 transition-colors"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-[#64748B] dark:text-slate-300 hover:text-[#0F172A] dark:hover:text-white bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors"
               >
-                <RotateCcw className="w-3.5 h-3.5 text-[#006B45]" />
+                <RotateCcw className="w-3.5 h-3.5 text-[#006B45] dark:text-emerald-400" />
                 <span>Clear Filters</span>
               </button>
             )}
@@ -943,25 +1541,25 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
 
         {/* Prominent Global Search Bar */}
         <div>
-          <label className="block text-xs font-bold text-[#0F172A] mb-1.5">
+          <label className="block text-xs font-bold text-[#0F172A] dark:text-slate-200 mb-1.5">
             Search
           </label>
           <div className="relative">
             <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none">
-              <Search className="w-4 h-4 text-[#006B45]" />
+              <Search className="w-4 h-4 text-[#006B45] dark:text-emerald-400" />
             </div>
             <input
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder={`Search across ${dataset.columns.join(', ')}...`}
-              className="w-full pl-10 pr-9 py-2.5 text-xs sm:text-sm bg-[#F8FAFC] border border-[#CBD5E1] rounded-xl text-[#0F172A] placeholder-[#94A3B8] focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#006B45] focus:border-[#006B45] transition-all"
+              className="w-full pl-10 pr-9 py-2.5 text-xs sm:text-sm bg-[#F8FAFC] dark:bg-slate-900 border border-[#CBD5E1] dark:border-slate-700 rounded-xl text-[#0F172A] dark:text-slate-100 placeholder-[#94A3B8] dark:placeholder-slate-500 focus:bg-white dark:focus:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-[#006B45] focus:border-[#006B45] transition-all"
             />
             {searchQuery && (
               <button
                 type="button"
                 onClick={() => setSearchQuery('')}
-                className="absolute inset-y-0 right-0 pr-3 flex items-center text-[#94A3B8] hover:text-[#0F172A]"
+                className="absolute inset-y-0 right-0 pr-3 flex items-center text-[#94A3B8] hover:text-[#0F172A] dark:hover:text-slate-200"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -969,7 +1567,7 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
           </div>
         </div>
 
-        {/* Dynamic Parameter Filters — generated directly from the Excel columns */}
+        {/* Dynamic Parameter Filters */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
           {dataset.filterConfigs.map((cfg) => {
             const currentVal = columnFilters[cfg.column] || (cfg.kind === 'select' ? 'All' : '');
@@ -977,13 +1575,13 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
             if (cfg.kind === 'select') {
               return (
                 <div key={cfg.column}>
-                  <label className="block text-xs font-bold text-[#0F172A] mb-1.5">
+                  <label className="block text-xs font-bold text-[#0F172A] dark:text-slate-200 mb-1.5">
                     {cfg.label}
                   </label>
                   <select
                     value={currentVal}
                     onChange={(e) => updateColumnFilter(cfg.column, e.target.value)}
-                    className="w-full px-3 py-2 text-xs bg-[#F8FAFC] border border-[#CBD5E1] rounded-xl text-[#0F172A] focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#006B45] focus:border-[#006B45] font-medium"
+                    className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-900 border border-[#CBD5E1] dark:border-slate-700 rounded-xl text-[#0F172A] dark:text-slate-100 focus:bg-white dark:focus:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-[#006B45] focus:border-[#006B45] font-medium"
                   >
                     <option value="All">
                       All {cfg.label} ({cfg.options.length})
@@ -1000,7 +1598,7 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
 
             return (
               <div key={cfg.column}>
-                <label className="block text-xs font-bold text-[#0F172A] mb-1.5">
+                <label className="block text-xs font-bold text-[#0F172A] dark:text-slate-200 mb-1.5">
                   {cfg.label}
                 </label>
                 <div className="relative">
@@ -1009,13 +1607,13 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                     value={currentVal}
                     onChange={(e) => updateColumnFilter(cfg.column, e.target.value)}
                     placeholder={`Filter by ${cfg.label}...`}
-                    className="w-full px-3 pr-7 py-2 text-xs bg-[#F8FAFC] border border-[#CBD5E1] rounded-xl text-[#0F172A] placeholder-[#94A3B8] focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#006B45] focus:border-[#006B45]"
+                    className="w-full px-3 pr-7 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-900 border border-[#CBD5E1] dark:border-slate-700 rounded-xl text-[#0F172A] dark:text-slate-100 placeholder-[#94A3B8] dark:placeholder-slate-500 focus:bg-white dark:focus:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-[#006B45] focus:border-[#006B45]"
                   />
                   {currentVal && (
                     <button
                       type="button"
                       onClick={() => updateColumnFilter(cfg.column, '')}
-                      className="absolute inset-y-0 right-0 pr-2 flex items-center text-[#94A3B8] hover:text-[#0F172A]"
+                      className="absolute inset-y-0 right-0 pr-2 flex items-center text-[#94A3B8] hover:text-[#0F172A] dark:hover:text-slate-200"
                     >
                       <X className="w-3.5 h-3.5" />
                     </button>
@@ -1029,21 +1627,33 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
 
       {/* 4. Branch Information Display (Cards or Table) */}
       {filteredBranches.length === 0 ? (
-        <div className="bg-white rounded-2xl border border-[#E2E8F0] p-12 text-center shadow-xs">
-          <Building2 className="w-12 h-12 text-[#94A3B8] mx-auto mb-3" />
-          <h3 className="text-base font-bold text-[#0F172A]">No Matching Branches Found</h3>
-          <p className="text-xs text-[#64748B] max-w-md mx-auto mt-1">
+        <div className="bg-white dark:bg-[#0F172A] rounded-2xl border border-[#E2E8F0] dark:border-slate-800 p-12 text-center shadow-xs">
+          <Building2 className="w-12 h-12 text-[#94A3B8] dark:text-slate-500 mx-auto mb-3" />
+          <h3 className="text-base font-bold text-[#0F172A] dark:text-slate-100">
+            No Matching Branches Found
+          </h3>
+          <p className="text-xs text-[#64748B] dark:text-slate-400 max-w-md mx-auto mt-1">
             No branch record matches your current search or filter criteria.
           </p>
-          {hasActiveFilters && (
+          <div className="mt-4 flex items-center justify-center gap-2">
+            {hasActiveFilters && (
+              <button
+                type="button"
+                onClick={handleClearFilters}
+                className="px-4 py-2 bg-[#006B45] text-white text-xs font-semibold rounded-xl hover:bg-[#064E3B] transition-colors"
+              >
+                Clear Filters
+              </button>
+            )}
             <button
               type="button"
-              onClick={handleClearFilters}
-              className="mt-4 px-4 py-2 bg-[#006B45] text-white text-xs font-semibold rounded-xl hover:bg-[#064E3B] transition-colors"
+              onClick={openAddModal}
+              className="inline-flex items-center gap-1.5 px-4 py-2 bg-[#F0FDF4] dark:bg-emerald-950/60 text-[#006B45] dark:text-emerald-300 border border-[#D1FAE5] dark:border-emerald-800 text-xs font-semibold rounded-xl hover:bg-emerald-100 dark:hover:bg-emerald-900/60 transition-colors"
             >
-              Clear Filters
+              <Plus className="w-3.5 h-3.5" />
+              <span>Add Branch</span>
             </button>
-          )}
+          </div>
         </div>
       ) : viewMode === 'cards' ? (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
@@ -1072,18 +1682,18 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
               <div
                 key={branch._rowKey}
                 onClick={() => setSelectedBranch(branch)}
-                className="bg-white rounded-2xl border border-[#E2E8F0] hover:border-[#006B45]/50 shadow-xs hover:shadow-md transition-all cursor-pointer flex flex-col justify-between overflow-hidden group"
+                className="bg-white dark:bg-[#0F172A] rounded-2xl border border-[#E2E8F0] dark:border-slate-800 hover:border-[#006B45]/50 dark:hover:border-emerald-500/60 shadow-xs hover:shadow-md transition-all cursor-pointer flex flex-col justify-between overflow-hidden group"
               >
                 <div className="p-4 sm:p-5 space-y-3">
                   {/* Card Header */}
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0">
                       {cols.snCol && (
-                        <span className="inline-block px-2 py-0.5 rounded-md bg-[#F0FDF4] text-[#006B45] border border-[#D1FAE5] font-mono font-bold text-[10px] mb-1.5">
+                        <span className="inline-block px-2 py-0.5 rounded-md bg-[#F0FDF4] dark:bg-emerald-950/60 text-[#006B45] dark:text-emerald-300 border border-[#D1FAE5] dark:border-emerald-800/70 font-mono font-bold text-[10px] mb-1.5">
                           {branchSn ? `S No. #${branchSn}` : 'S No. Not Available'}
                         </span>
                       )}
-                      <h4 className="text-base font-extrabold text-[#0F172A] group-hover:text-[#006B45] transition-colors">
+                      <h4 className="text-base font-extrabold text-[#0F172A] dark:text-slate-100 group-hover:text-[#006B45] dark:group-hover:text-emerald-400 transition-colors">
                         {branchTitle}
                       </h4>
                     </div>
@@ -1091,17 +1701,17 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
 
                   {/* Contact Number */}
                   {cols.phoneCol && (
-                    <div className="flex items-center justify-between bg-[#F0FDF4] border border-[#D1FAE5] rounded-xl px-3 py-2">
+                    <div className="flex items-center justify-between bg-[#F0FDF4] dark:bg-emerald-950/40 border border-[#D1FAE5] dark:border-emerald-800/60 rounded-xl px-3 py-2">
                       <div className="flex items-center gap-2 text-xs min-w-0">
-                        <Phone className="w-3.5 h-3.5 text-[#006B45] shrink-0" />
-                        <span className="text-[#064E3B]/80 font-semibold shrink-0">
+                        <Phone className="w-3.5 h-3.5 text-[#006B45] dark:text-emerald-400 shrink-0" />
+                        <span className="text-[#064E3B]/80 dark:text-emerald-300/80 font-semibold shrink-0">
                           {cols.phoneCol}:
                         </span>
                         <span
                           className={`truncate ${
                             branchPhone
-                              ? 'font-mono font-extrabold text-[#064E3B]'
-                              : 'italic text-[#64748B]'
+                              ? 'font-mono font-extrabold text-[#064E3B] dark:text-emerald-200'
+                              : 'italic text-[#64748B] dark:text-slate-500'
                           }`}
                         >
                           {branchPhone || 'Not Available'}
@@ -1118,11 +1728,11 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                               `Copied ${cols.phoneCol}: ${branchPhone}`
                             );
                           }}
-                          className="p-1 rounded-md hover:bg-emerald-200/50 text-[#006B45] shrink-0"
+                          className="p-1 rounded-md hover:bg-emerald-200/50 dark:hover:bg-emerald-900/60 text-[#006B45] dark:text-emerald-400 shrink-0"
                           title="Copy Contact Number"
                         >
                           {copiedKey === `card-ph-${branch._rowKey}` ? (
-                            <Check className="w-3.5 h-3.5 text-emerald-700" />
+                            <Check className="w-3.5 h-3.5 text-emerald-700 dark:text-emerald-300" />
                           ) : (
                             <Copy className="w-3.5 h-3.5" />
                           )}
@@ -1133,18 +1743,18 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
 
                   {/* Location / Address */}
                   {(cols.locationCol || cols.addressCol) && (
-                    <div className="bg-[#F8FAFC] border border-[#E2E8F0] rounded-xl p-3 flex items-start justify-between gap-2 text-xs">
+                    <div className="bg-[#F8FAFC] dark:bg-slate-900 border border-[#E2E8F0] dark:border-slate-800 rounded-xl p-3 flex items-start justify-between gap-2 text-xs">
                       <div className="flex items-start gap-2 min-w-0">
-                        <MapPin className="w-3.5 h-3.5 text-[#006B45] shrink-0 mt-0.5" />
+                        <MapPin className="w-3.5 h-3.5 text-[#006B45] dark:text-emerald-400 shrink-0 mt-0.5" />
                         <div className="min-w-0">
-                          <span className="block text-[10px] font-bold uppercase tracking-wider text-[#64748B]">
+                          <span className="block text-[10px] font-bold uppercase tracking-wider text-[#64748B] dark:text-slate-400">
                             {cols.locationCol || cols.addressCol}
                           </span>
                           <span
                             className={`mt-0.5 block break-words leading-relaxed ${
                               branchLocation
-                                ? 'text-[#0F172A] font-medium'
-                                : 'text-[#94A3B8] italic'
+                                ? 'text-[#0F172A] dark:text-slate-200 font-medium'
+                                : 'text-[#94A3B8] dark:text-slate-500 italic'
                             }`}
                           >
                             {branchLocation || 'Not Available'}
@@ -1162,11 +1772,11 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                               'Copied branch location'
                             );
                           }}
-                          className="p-1 rounded hover:bg-slate-200 text-[#64748B] hover:text-[#006B45] shrink-0"
+                          className="p-1 rounded hover:bg-slate-200 dark:hover:bg-slate-800 text-[#64748B] dark:text-slate-400 hover:text-[#006B45] dark:hover:text-emerald-400 shrink-0"
                           title="Copy Location"
                         >
                           {copiedKey === `card-loc-${branch._rowKey}` ? (
-                            <Check className="w-3.5 h-3.5 text-emerald-600" />
+                            <Check className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
                           ) : (
                             <Copy className="w-3.5 h-3.5" />
                           )}
@@ -1175,20 +1785,22 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                     </div>
                   )}
 
-                  {/* Any Additional Columns (if present in uploaded Excel) */}
+                  {/* Any Additional Columns */}
                   {extraCardCols.length > 0 && (
                     <div className="grid grid-cols-1 gap-1.5 text-xs pt-1">
                       {extraCardCols.map((col) => (
                         <div
                           key={col}
-                          className="flex items-center justify-between gap-2 text-[11px] bg-[#F8FAFC] px-2.5 py-1.5 rounded-lg border border-[#E2E8F0]"
+                          className="flex items-center justify-between gap-2 text-[11px] bg-[#F8FAFC] dark:bg-slate-900 px-2.5 py-1.5 rounded-lg border border-[#E2E8F0] dark:border-slate-800"
                         >
-                          <span className="font-semibold text-[#64748B]">{col}:</span>
+                          <span className="font-semibold text-[#64748B] dark:text-slate-400">
+                            {col}:
+                          </span>
                           <span
                             className={
                               isEmpty(branch.fields[col])
-                                ? 'italic text-[#94A3B8]'
-                                : 'font-bold text-[#0F172A] truncate'
+                                ? 'italic text-[#94A3B8] dark:text-slate-500'
+                                : 'font-bold text-[#0F172A] dark:text-slate-100 truncate'
                             }
                           >
                             {formatValue(branch.fields[col])}
@@ -1201,10 +1813,10 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
 
                 {/* Card Quick Actions Footer */}
                 <div
-                  className="px-4 py-2.5 bg-[#F8FAFC] border-t border-[#E2E8F0] flex items-center justify-between gap-2"
+                  className="px-4 py-2.5 bg-[#F8FAFC] dark:bg-slate-900/90 border-t border-[#E2E8F0] dark:border-slate-800 flex flex-wrap items-center justify-between gap-2"
                   onClick={(e) => e.stopPropagation()}
                 >
-                  <div className="flex items-center gap-1.5">
+                  <div className="flex flex-wrap items-center gap-1.5">
                     <button
                       type="button"
                       onClick={() =>
@@ -1214,47 +1826,49 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                           `Copied ${branchTitle} info`
                         )
                       }
-                      className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-white border border-[#CBD5E1] hover:border-[#006B45] text-[#0F172A] hover:text-[#006B45] text-[11px] font-semibold transition-colors"
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-white dark:bg-slate-800 border border-[#CBD5E1] dark:border-slate-700 hover:border-[#006B45] text-[#0F172A] dark:text-slate-200 hover:text-[#006B45] dark:hover:text-emerald-400 text-[11px] font-semibold transition-colors"
                       title="Copy Branch Information"
                     >
                       {copiedKey === `card-info-${branch._rowKey}` ? (
-                        <Check className="w-3 h-3 text-emerald-600" />
+                        <Check className="w-3 h-3 text-emerald-600 dark:text-emerald-400" />
                       ) : (
-                        <Copy className="w-3 h-3 text-[#006B45]" />
+                        <Copy className="w-3 h-3 text-[#006B45] dark:text-emerald-400" />
                       )}
-                      <span>Copy Info</span>
+                      <span>Copy</span>
                     </button>
-
-                    {branchPhone && (
-                      <button
-                        type="button"
-                        onClick={() =>
-                          handleCopyText(
-                            branchPhone,
-                            `card-cph-${branch._rowKey}`,
-                            `Copied contact: ${branchPhone}`
-                          )
-                        }
-                        className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-white border border-[#CBD5E1] hover:border-[#006B45] text-[#0F172A] hover:text-[#006B45] text-[11px] font-semibold transition-colors"
-                        title="Copy Contact Number"
-                      >
-                        <Phone className="w-3 h-3 text-[#006B45]" />
-                        <span>Number</span>
-                      </button>
-                    )}
 
                     {mapHref && (
                       <a
                         href={mapHref}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-white border border-[#CBD5E1] hover:border-[#006B45] text-[#006B45] text-[11px] font-semibold transition-colors"
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-white dark:bg-slate-800 border border-[#CBD5E1] dark:border-slate-700 hover:border-[#006B45] text-[#006B45] dark:text-emerald-400 text-[11px] font-semibold transition-colors"
                         title="Open in Google Maps"
                       >
                         <MapPin className="w-3 h-3" />
                         <span>Map</span>
                       </a>
                     )}
+
+                    <button
+                      type="button"
+                      onClick={() => openEditModal(branch)}
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-white dark:bg-slate-800 border border-[#CBD5E1] dark:border-slate-700 hover:border-[#006B45] text-[#0F172A] dark:text-slate-200 hover:text-[#006B45] dark:hover:text-emerald-400 text-[11px] font-semibold transition-colors"
+                      title={`Edit ${branchTitle}`}
+                    >
+                      <Pencil className="w-3 h-3 text-[#006B45] dark:text-emerald-400" />
+                      <span>Edit</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setDeletingRecord(branch)}
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-800 hover:bg-rose-100 dark:hover:bg-rose-900/60 text-rose-700 dark:text-rose-300 text-[11px] font-semibold transition-colors"
+                      title={`Delete ${branchTitle}`}
+                    >
+                      <Trash2 className="w-3 h-3" />
+                      <span>Delete</span>
+                    </button>
                   </div>
 
                   <button
@@ -1272,11 +1886,11 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
         </div>
       ) : (
         /* Structured Table View */
-        <div className="bg-white rounded-2xl border border-[#E2E8F0] shadow-xs overflow-hidden">
+        <div className="bg-white dark:bg-[#0F172A] rounded-2xl border border-[#E2E8F0] dark:border-slate-800 shadow-xs overflow-hidden">
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs">
               <thead>
-                <tr className="bg-[#F8FAFC] border-b border-[#E2E8F0] text-[#475569] font-bold text-[11px] uppercase tracking-wider">
+                <tr className="bg-[#F8FAFC] dark:bg-slate-900 border-b border-[#E2E8F0] dark:border-slate-800 text-[#475569] dark:text-slate-300 font-bold text-[11px] uppercase tracking-wider">
                   {dataset.columns.map((col) => (
                     <th key={col} className="py-3.5 px-4 whitespace-nowrap">
                       {col}
@@ -1285,17 +1899,18 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                   <th className="py-3.5 px-4 text-right whitespace-nowrap">Quick Actions</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-[#E2E8F0]">
+              <tbody className="divide-y divide-[#E2E8F0] dark:divide-slate-800">
                 {filteredBranches.map((branch, idx) => {
                   const branchPhone = getBranchPhone(branch);
+                  const branchTitle = getBranchTitle(branch);
                   return (
                     <tr
                       key={branch._rowKey}
                       onClick={() => setSelectedBranch(branch)}
                       className={`cursor-pointer transition-colors ${
                         idx % 2 === 0
-                          ? 'bg-white hover:bg-emerald-50/40'
-                          : 'bg-[#FAFAFA] hover:bg-emerald-50/40'
+                          ? 'bg-white dark:bg-[#0F172A] hover:bg-emerald-50/40 dark:hover:bg-emerald-950/30'
+                          : 'bg-[#FAFAFA] dark:bg-slate-900/40 hover:bg-emerald-50/40 dark:hover:bg-emerald-950/30'
                       }`}
                     >
                       {dataset.columns.map((col) => {
@@ -1312,17 +1927,21 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                             }`}
                           >
                             {isEmpty(val) ? (
-                              <span className="text-[#94A3B8] italic">Not Available</span>
+                              <span className="text-[#94A3B8] dark:text-slate-500 italic">
+                                Not Available
+                              </span>
                             ) : isNameCol ? (
-                              <span className="font-extrabold text-[#006B45] hover:underline">
+                              <span className="font-extrabold text-[#006B45] dark:text-emerald-400 hover:underline">
                                 {val}
                               </span>
                             ) : isPhoneCol ? (
-                              <span className="font-mono font-semibold text-[#0F172A]">
+                              <span className="font-mono font-semibold text-[#0F172A] dark:text-slate-100">
                                 {val}
                               </span>
                             ) : (
-                              <span className="text-[#0F172A] font-medium">{val}</span>
+                              <span className="text-[#0F172A] dark:text-slate-200 font-medium">
+                                {val}
+                              </span>
                             )}
                           </td>
                         );
@@ -1342,11 +1961,29 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
                                   `Copied contact: ${branchPhone}`
                                 )
                               }
-                              className="px-2 py-1 rounded-lg bg-[#F8FAFC] border border-[#CBD5E1] hover:border-[#006B45] text-[11px] font-semibold text-[#0F172A]"
+                              className="px-2 py-1 rounded-lg bg-[#F8FAFC] dark:bg-slate-800 border border-[#CBD5E1] dark:border-slate-700 hover:border-[#006B45] text-[11px] font-semibold text-[#0F172A] dark:text-slate-200"
                             >
                               Copy #
                             </button>
                           )}
+                          <button
+                            type="button"
+                            onClick={() => openEditModal(branch)}
+                            className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-[#F8FAFC] dark:bg-slate-800 border border-[#CBD5E1] dark:border-slate-700 hover:border-[#006B45] text-[11px] font-semibold text-[#0F172A] dark:text-slate-200"
+                            title={`Edit ${branchTitle}`}
+                          >
+                            <Pencil className="w-3 h-3 text-[#006B45] dark:text-emerald-400" />
+                            <span>Edit</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setDeletingRecord(branch)}
+                            className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-800 hover:bg-rose-100 dark:hover:bg-rose-900/60 text-[11px] font-semibold text-rose-700 dark:text-rose-300"
+                            title={`Delete ${branchTitle}`}
+                          >
+                            <Trash2 className="w-3 h-3" />
+                            <span>Delete</span>
+                          </button>
                           <button
                             type="button"
                             onClick={() => setSelectedBranch(branch)}
@@ -1367,15 +2004,15 @@ export const BranchInformationPage: React.FC<BranchInformationPageProps> = ({
 
       {/* 5. Branch & Training Operational Notes (Extracted from Excel sheet) */}
       {dataset.notes.length > 0 && (
-        <div className="bg-[#F0FDF4] border border-[#D1FAE5] rounded-2xl p-4 sm:p-5 space-y-2.5">
-          <div className="flex items-center gap-2 text-xs font-extrabold uppercase tracking-wider text-[#064E3B]">
-            <Info className="w-4 h-4 text-[#006B45]" />
+        <div className="bg-[#F0FDF4] dark:bg-emerald-950/40 border border-[#D1FAE5] dark:border-emerald-800/70 rounded-2xl p-4 sm:p-5 space-y-2.5">
+          <div className="flex items-center gap-2 text-xs font-extrabold uppercase tracking-wider text-[#064E3B] dark:text-emerald-300">
+            <Info className="w-4 h-4 text-[#006B45] dark:text-emerald-400" />
             <span>Additional Notes from Branch List</span>
           </div>
-          <ul className="space-y-1.5 text-xs text-[#064E3B]">
+          <ul className="space-y-1.5 text-xs text-[#064E3B] dark:text-emerald-200">
             {dataset.notes.map((note, idx) => (
               <li key={idx} className="flex items-start gap-2">
-                <span className="w-1.5 h-1.5 rounded-full bg-[#006B45] mt-1.5 shrink-0" />
+                <span className="w-1.5 h-1.5 rounded-full bg-[#006B45] dark:bg-emerald-400 mt-1.5 shrink-0" />
                 <span className="font-medium leading-relaxed">{note}</span>
               </li>
             ))}

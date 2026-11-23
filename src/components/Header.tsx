@@ -1,8 +1,19 @@
 import React from 'react';
-import { SlidersHorizontal, CheckCircle2, Bus, MapPin, Users, Building2 } from 'lucide-react';
+import {
+  SlidersHorizontal,
+  CheckCircle2,
+  Bus,
+  MapPin,
+  Users,
+  Building2,
+  Sparkles,
+  Sun,
+  Moon,
+} from 'lucide-react';
 import { DataSourceState } from '../types/pricing';
+import { useTheme } from '../context/ThemeContext';
 
-export type ActiveTab = 'filter' | 'transport' | 'branches' | 'instructors' | 'branch-info';
+export type ActiveTab = 'filter' | 'transport' | 'ai-transport-finder' | 'branches' | 'instructors' | 'branch-info';
 
 interface HeaderProps {
   activeTab: ActiveTab;
@@ -15,10 +26,12 @@ export const Header: React.FC<HeaderProps> = ({
   setActiveTab,
   dataSource,
 }) => {
+  const { isDark, toggleTheme } = useTheme();
+
   return (
-    <header className="sticky top-0 z-40 bg-white border-b border-[#E2E8F0]">
+    <header className="sticky top-0 z-40 bg-white dark:bg-[#0F172A] border-b border-[#E2E8F0] dark:border-slate-800 transition-colors duration-200">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="flex items-center justify-between gap-6 h-16">
+        <div className="flex items-center justify-between gap-4 sm:gap-6 h-16">
           {/* Zone 1: Official Logo in brand container on mobile/tablet */}
           <div className="flex items-center gap-3 shrink-0 lg:hidden">
             <a
@@ -43,12 +56,13 @@ export const Header: React.FC<HeaderProps> = ({
           </div>
 
           {/* Breadcrumb / Title on Desktop */}
-          <div className="hidden lg:flex items-center gap-2 text-xs text-[#64748B]">
-            <span className="font-semibold text-[#0F172A]">Eco Drive</span>
+          <div className="hidden lg:flex items-center gap-2 text-xs text-[#64748B] dark:text-slate-400">
+            <span className="font-semibold text-[#0F172A] dark:text-slate-100">Eco Drive</span>
             <span>/</span>
-            <span className="text-[#006B45] font-semibold">
+            <span className="text-[#006B45] dark:text-emerald-400 font-semibold">
               {activeTab === 'filter' && 'Search by Filter'}
               {activeTab === 'transport' && 'Transportation'}
+              {activeTab === 'ai-transport-finder' && 'AI Smart Transportation Finder'}
               {activeTab === 'branches' && 'Branch and Location'}
               {activeTab === 'branch-info' && 'Branch Information'}
               {activeTab === 'instructors' && 'Instructors'}
@@ -56,13 +70,13 @@ export const Header: React.FC<HeaderProps> = ({
           </div>
 
           {/* Zone 2: Navigation links on tablet / medium screens */}
-          <nav className="hidden sm:flex lg:hidden items-center gap-1 text-sm font-medium">
+          <nav className="hidden sm:flex lg:hidden items-center gap-1 text-sm font-medium overflow-x-auto">
             <button
               onClick={() => setActiveTab('filter')}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap shrink-0 text-xs font-semibold ${
                 activeTab === 'filter'
-                  ? 'bg-[#F0FDF4] text-[#006B45] border border-[#D1FAE5]'
-                  : 'text-[#64748B] hover:text-[#0F172A] hover:bg-slate-50'
+                  ? 'bg-[#F0FDF4] dark:bg-emerald-950/70 text-[#006B45] dark:text-emerald-300 border border-[#D1FAE5] dark:border-emerald-800/70'
+                  : 'text-[#64748B] dark:text-slate-300 hover:text-[#0F172A] dark:hover:text-white hover:bg-slate-50 dark:hover:bg-slate-800'
               }`}
             >
               <SlidersHorizontal className="w-3.5 h-3.5" />
@@ -73,8 +87,8 @@ export const Header: React.FC<HeaderProps> = ({
               onClick={() => setActiveTab('transport')}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap shrink-0 text-xs font-semibold ${
                 activeTab === 'transport'
-                  ? 'bg-[#F0FDF4] text-[#006B45] border border-[#D1FAE5]'
-                  : 'text-[#64748B] hover:text-[#0F172A] hover:bg-slate-50'
+                  ? 'bg-[#F0FDF4] dark:bg-emerald-950/70 text-[#006B45] dark:text-emerald-300 border border-[#D1FAE5] dark:border-emerald-800/70'
+                  : 'text-[#64748B] dark:text-slate-300 hover:text-[#0F172A] dark:hover:text-white hover:bg-slate-50 dark:hover:bg-slate-800'
               }`}
             >
               <Bus className="w-3.5 h-3.5" />
@@ -82,11 +96,23 @@ export const Header: React.FC<HeaderProps> = ({
             </button>
 
             <button
+              onClick={() => setActiveTab('ai-transport-finder')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap shrink-0 text-xs font-semibold ${
+                activeTab === 'ai-transport-finder'
+                  ? 'bg-[#F0FDF4] dark:bg-emerald-950/70 text-[#006B45] dark:text-emerald-300 border border-[#D1FAE5] dark:border-emerald-800/70'
+                  : 'text-[#64748B] dark:text-slate-300 hover:text-[#0F172A] dark:hover:text-white hover:bg-slate-50 dark:hover:bg-slate-800'
+              }`}
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>AI Bus Finder</span>
+            </button>
+
+            <button
               onClick={() => setActiveTab('branches')}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap shrink-0 text-xs font-semibold ${
                 activeTab === 'branches'
-                  ? 'bg-[#F0FDF4] text-[#006B45] border border-[#D1FAE5]'
-                  : 'text-[#64748B] hover:text-[#0F172A] hover:bg-slate-50'
+                  ? 'bg-[#F0FDF4] dark:bg-emerald-950/70 text-[#006B45] dark:text-emerald-300 border border-[#D1FAE5] dark:border-emerald-800/70'
+                  : 'text-[#64748B] dark:text-slate-300 hover:text-[#0F172A] dark:hover:text-white hover:bg-slate-50 dark:hover:bg-slate-800'
               }`}
             >
               <MapPin className="w-3.5 h-3.5" />
@@ -97,8 +123,8 @@ export const Header: React.FC<HeaderProps> = ({
               onClick={() => setActiveTab('branch-info')}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap shrink-0 text-xs font-semibold ${
                 activeTab === 'branch-info'
-                  ? 'bg-[#F0FDF4] text-[#006B45] border border-[#D1FAE5]'
-                  : 'text-[#64748B] hover:text-[#0F172A] hover:bg-slate-50'
+                  ? 'bg-[#F0FDF4] dark:bg-emerald-950/70 text-[#006B45] dark:text-emerald-300 border border-[#D1FAE5] dark:border-emerald-800/70'
+                  : 'text-[#64748B] dark:text-slate-300 hover:text-[#0F172A] dark:hover:text-white hover:bg-slate-50 dark:hover:bg-slate-800'
               }`}
             >
               <Building2 className="w-3.5 h-3.5" />
@@ -109,8 +135,8 @@ export const Header: React.FC<HeaderProps> = ({
               onClick={() => setActiveTab('instructors')}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap shrink-0 text-xs font-semibold ${
                 activeTab === 'instructors'
-                  ? 'bg-[#F0FDF4] text-[#006B45] border border-[#D1FAE5]'
-                  : 'text-[#64748B] hover:text-[#0F172A] hover:bg-slate-50'
+                  ? 'bg-[#F0FDF4] dark:bg-emerald-950/70 text-[#006B45] dark:text-emerald-300 border border-[#D1FAE5] dark:border-emerald-800/70'
+                  : 'text-[#64748B] dark:text-slate-300 hover:text-[#0F172A] dark:hover:text-white hover:bg-slate-50 dark:hover:bg-slate-800'
               }`}
             >
               <Users className="w-3.5 h-3.5" />
@@ -118,10 +144,31 @@ export const Header: React.FC<HeaderProps> = ({
             </button>
           </nav>
 
-          {/* Zone 3: Live Verified Source Badge */}
-          <div className="flex items-center gap-3 shrink-0 ml-auto">
-            <div className="flex items-center gap-2 bg-[#F0FDF4] border border-[#D1FAE5] text-[#064E3B] px-3 py-1.5 rounded-lg text-xs font-medium">
-              <CheckCircle2 className="w-3.5 h-3.5 text-[#059669] shrink-0" />
+          {/* Zone 3: Theme Toggle + Live Verified Source Badge */}
+          <div className="flex items-center gap-2.5 shrink-0 ml-auto">
+            <button
+              type="button"
+              onClick={toggleTheme}
+              aria-label={isDark ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+              aria-pressed={isDark}
+              title={isDark ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[#CBD5E1] dark:border-slate-700 bg-[#F8FAFC] dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-[#0F172A] dark:text-slate-100 text-xs font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-[#006B45]"
+            >
+              {isDark ? (
+                <>
+                  <Sun className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                  <span className="hidden md:inline">Light Mode</span>
+                </>
+              ) : (
+                <>
+                  <Moon className="w-3.5 h-3.5 text-[#064E3B] shrink-0" />
+                  <span className="hidden md:inline">Dark Mode</span>
+                </>
+              )}
+            </button>
+
+            <div className="flex items-center gap-2 bg-[#F0FDF4] dark:bg-emerald-950/60 border border-[#D1FAE5] dark:border-emerald-800/70 text-[#064E3B] dark:text-emerald-200 px-3 py-1.5 rounded-lg text-xs font-medium">
+              <CheckCircle2 className="w-3.5 h-3.5 text-[#059669] dark:text-emerald-400 shrink-0" />
               <span className="hidden sm:inline">Eco Drive Official Rates ·</span>
               <span className="font-semibold">{dataSource.availablePricesCount} Active Tariffs</span>
             </div>
@@ -129,11 +176,11 @@ export const Header: React.FC<HeaderProps> = ({
         </div>
 
         {/* Mobile Navigation Bar */}
-        <div className="sm:hidden flex items-center justify-around py-2 border-t border-[#E2E8F0] text-xs font-medium text-[#64748B]">
+        <div className="sm:hidden flex items-center justify-around py-2 border-t border-[#E2E8F0] dark:border-slate-800 text-xs font-medium text-[#64748B] dark:text-slate-400">
           <button
             onClick={() => setActiveTab('filter')}
             className={`flex flex-col items-center gap-1 py-1 px-1.5 rounded-lg ${
-              activeTab === 'filter' ? 'text-[#006B45] font-bold bg-[#F0FDF4]' : ''
+              activeTab === 'filter' ? 'text-[#006B45] dark:text-emerald-300 font-bold bg-[#F0FDF4] dark:bg-emerald-950/70' : ''
             }`}
           >
             <SlidersHorizontal className="w-4 h-4" />
@@ -142,16 +189,25 @@ export const Header: React.FC<HeaderProps> = ({
           <button
             onClick={() => setActiveTab('transport')}
             className={`flex flex-col items-center gap-1 py-1 px-1.5 rounded-lg ${
-              activeTab === 'transport' ? 'text-[#006B45] font-bold bg-[#F0FDF4]' : ''
+              activeTab === 'transport' ? 'text-[#006B45] dark:text-emerald-300 font-bold bg-[#F0FDF4] dark:bg-emerald-950/70' : ''
             }`}
           >
             <Bus className="w-4 h-4" />
             <span className="text-[10px]">Bus</span>
           </button>
           <button
+            onClick={() => setActiveTab('ai-transport-finder')}
+            className={`flex flex-col items-center gap-1 py-1 px-1.5 rounded-lg ${
+              activeTab === 'ai-transport-finder' ? 'text-[#006B45] dark:text-emerald-300 font-bold bg-[#F0FDF4] dark:bg-emerald-950/70' : ''
+            }`}
+          >
+            <Sparkles className="w-4 h-4" />
+            <span className="text-[10px]">AI Finder</span>
+          </button>
+          <button
             onClick={() => setActiveTab('branches')}
             className={`flex flex-col items-center gap-1 py-1 px-1.5 rounded-lg ${
-              activeTab === 'branches' ? 'text-[#006B45] font-bold bg-[#F0FDF4]' : ''
+              activeTab === 'branches' ? 'text-[#006B45] dark:text-emerald-300 font-bold bg-[#F0FDF4] dark:bg-emerald-950/70' : ''
             }`}
           >
             <MapPin className="w-4 h-4" />
@@ -160,7 +216,7 @@ export const Header: React.FC<HeaderProps> = ({
           <button
             onClick={() => setActiveTab('branch-info')}
             className={`flex flex-col items-center gap-1 py-1 px-1.5 rounded-lg ${
-              activeTab === 'branch-info' ? 'text-[#006B45] font-bold bg-[#F0FDF4]' : ''
+              activeTab === 'branch-info' ? 'text-[#006B45] dark:text-emerald-300 font-bold bg-[#F0FDF4] dark:bg-emerald-950/70' : ''
             }`}
           >
             <Building2 className="w-4 h-4" />
@@ -169,7 +225,7 @@ export const Header: React.FC<HeaderProps> = ({
           <button
             onClick={() => setActiveTab('instructors')}
             className={`flex flex-col items-center gap-1 py-1 px-1.5 rounded-lg ${
-              activeTab === 'instructors' ? 'text-[#006B45] font-bold bg-[#F0FDF4]' : ''
+              activeTab === 'instructors' ? 'text-[#006B45] dark:text-emerald-300 font-bold bg-[#F0FDF4] dark:bg-emerald-950/70' : ''
             }`}
           >
             <Users className="w-4 h-4" />

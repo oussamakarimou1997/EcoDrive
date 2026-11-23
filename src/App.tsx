@@ -1,8 +1,9 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { Header, ActiveTab } from './components/Header';
 import { Sidebar } from './components/Sidebar';
 import { SearchByFilter } from './components/SearchByFilter';
 import { TransportationPage } from './components/TransportationPage';
+import { AISmartTransportFinderPage } from './components/AISmartTransportFinderPage';
 import { BranchLocationPage } from './components/BranchLocationPage';
 import { BranchInformationPage } from './components/BranchInformationPage';
 import { InstructorsPage } from './components/InstructorsPage';
@@ -13,6 +14,7 @@ import {
 import { loadSavedMatrix } from './services/sheetsService';
 import { normalizeMatrix } from './data/defaultPriceData';
 import { CheckCircle2 } from 'lucide-react';
+import { ThemeProvider } from './context/ThemeContext';
 
 export default function App() {
   // Load initial matrix & metadata
@@ -22,8 +24,17 @@ export default function App() {
   // Compute normalized records whenever matrix changes
   const records = useMemo(() => normalizeMatrix(matrix), [matrix]);
 
-  // Navigation tab state (filter | transport | branches | branch-info | instructors)
+  // Navigation tab state (filter | transport | ai-transport-finder | branches | branch-info | instructors)
   const [activeTab, setActiveTab] = useState<ActiveTab>('filter');
+
+  // Google Maps Platform Demo Key quota banner state
+  const [gmpQuotaExceeded, setGmpQuotaExceeded] = useState(false);
+
+  useEffect(() => {
+    const handleQuotaExceeded = () => setGmpQuotaExceeded(true);
+    window.addEventListener('gmp-quota-exceeded', handleQuotaExceeded);
+    return () => window.removeEventListener('gmp-quota-exceeded', handleQuotaExceeded);
+  }, []);
 
   // Notification toast state
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -56,6 +67,11 @@ export default function App() {
           title: 'Transportation Schedule',
           description: 'Official bus routes, student pickup points, GPS map pins, and timetables for Al Quoz and DIC centres.',
         };
+      case 'ai-transport-finder':
+        return {
+          title: 'AI Smart Transportation Finder',
+          description: 'Locate your nearest official Eco Drive bus pickup station anywhere in Dubai, inspect walking distances, and track the next live departure.',
+        };
       case 'branches':
         return {
           title: 'Branch and Location',
@@ -81,8 +97,9 @@ export default function App() {
   }, [activeTab]);
 
   return (
-    <div className="min-h-screen bg-[#F8FAFC] flex text-[#0F172A]">
-      {/* 1. Desktop Royal Green Sidebar Navigation */}
+    <ThemeProvider>
+      <div className="min-h-screen bg-[#F8FAFC] dark:bg-[#090D16] flex text-[#0F172A] dark:text-slate-100 transition-colors duration-200">
+        {/* 1. Desktop Royal Green Sidebar Navigation */}
       <Sidebar
         activeTab={activeTab}
         setActiveTab={setActiveTab}
@@ -91,6 +108,23 @@ export default function App() {
 
       {/* 2. Main Content Viewport */}
       <div className="flex-1 flex flex-col min-w-0">
+        {gmpQuotaExceeded && (
+          <div className="bg-amber-50 border-b border-amber-200 text-amber-900 px-4 py-2.5 text-xs md:text-sm text-center sticky top-0 z-50 shadow-sm">
+            <span>
+              Google Maps Platform quota reached. If you are the app owner, visit{' '}
+              <a
+                href="https://developers.google.com/maps/ai/ai-studio?utm_campaign=gmp_mcp_codeassist_v1_aistudio#quota_exceeded_errors"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline font-semibold text-amber-950 hover:text-amber-800"
+              >
+                maps developer site
+              </a>{' '}
+              for instructions to update your account.
+            </span>
+          </div>
+        )}
+
         {/* Top Header */}
         <Header
           activeTab={activeTab}
@@ -99,7 +133,7 @@ export default function App() {
         />
 
         {/* Hero Banner Strip (Royal Green & Dark Forest with Official Eco Drive Logo) */}
-        <div className="bg-[#064E3B] text-white border-b border-[#004d32]">
+        <div className="bg-[#064E3B] dark:bg-[#043427] text-white border-b border-[#004d32] dark:border-emerald-900/60 transition-colors duration-200">
           <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-5">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <div className="flex items-start sm:items-center gap-4">
@@ -159,6 +193,10 @@ export default function App() {
             <TransportationPage />
           )}
 
+          {activeTab === 'ai-transport-finder' && (
+            <AISmartTransportFinderPage />
+          )}
+
           {activeTab === 'branches' && (
             <BranchLocationPage />
           )}
@@ -173,9 +211,9 @@ export default function App() {
         </main>
 
         {/* Footer */}
-        <footer className="bg-white border-t border-[#E2E8F0] py-4 mt-auto">
-          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between text-xs text-[#64748B] gap-2">
-            <span className="font-medium text-[#0F172A]">Eco Drive · Eco Drive Driving institute Tariff Search</span>
+        <footer className="bg-white dark:bg-[#0F172A] border-t border-[#E2E8F0] dark:border-slate-800 py-4 mt-auto transition-colors duration-200">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between text-xs text-[#64748B] dark:text-slate-400 gap-2">
+            <span className="font-medium text-[#0F172A] dark:text-slate-200">Eco Drive · Eco Drive Driving institute Tariff Search</span>
             <div className="flex items-center gap-4">
               <span>21 Verified Services</span>
               <span>·</span>
@@ -187,11 +225,12 @@ export default function App() {
 
       {/* Toast Notification */}
       {toastMessage && (
-        <div className="fixed bottom-5 right-5 z-50 bg-[#064E3B] text-white px-4 py-3 rounded-xl shadow-lg border border-[#006B45] text-xs font-semibold flex items-center gap-2 animate-in fade-in slide-in-from-bottom-2 duration-200">
+        <div className="fixed bottom-5 right-5 z-50 bg-[#064E3B] dark:bg-emerald-950 text-white px-4 py-3 rounded-xl shadow-lg border border-[#006B45] dark:border-emerald-700 text-xs font-semibold flex items-center gap-2 animate-in fade-in slide-in-from-bottom-2 duration-200">
           <CheckCircle2 className="w-4 h-4 text-emerald-400" />
           <span>{toastMessage}</span>
         </div>
       )}
     </div>
+    </ThemeProvider>
   );
 }

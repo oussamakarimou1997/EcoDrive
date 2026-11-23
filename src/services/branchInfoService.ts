@@ -141,6 +141,97 @@ export function getDefaultBranchInfoDataset(): BranchInfoDataset {
   };
 }
 
+export class BranchApiValidationError extends Error {
+  public fieldErrors: Record<string, string>;
+  constructor(message: string, fieldErrors: Record<string, string> = {}) {
+    super(message);
+    this.name = 'BranchApiValidationError';
+    this.fieldErrors = fieldErrors;
+  }
+}
+
+async function parseBranchJsonError(res: Response, fallbackMsg: string): Promise<never> {
+  let body: { error?: string; fieldErrors?: Record<string, string> } = {};
+  try {
+    body = (await res.json()) as { error?: string; fieldErrors?: Record<string, string> };
+  } catch {
+    // ignore JSON parse error
+  }
+  if (res.status === 400) {
+    throw new BranchApiValidationError(body.error || fallbackMsg, body.fieldErrors || {});
+  }
+  throw new Error(body.error || fallbackMsg);
+}
+
+export async function fetchBranchInfoDataset(): Promise<BranchInfoDataset> {
+  const res = await fetch('/api/branch-info');
+  if (!res.ok) {
+    await parseBranchJsonError(res, 'Failed to load branch information from database.');
+  }
+  return (await res.json()) as BranchInfoDataset;
+}
+
+export async function createBranchInfoRecord(
+  fields: Record<string, string>,
+  sheetName = 'Sheet1'
+): Promise<BranchInfoRecord> {
+  const res = await fetch('/api/branch-info', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fields, sheetName }),
+  });
+  if (!res.ok) {
+    await parseBranchJsonError(res, 'Failed to add branch.');
+  }
+  const data = (await res.json()) as { record: BranchInfoRecord };
+  return data.record;
+}
+
+export async function updateBranchInfoRecord(
+  rowKey: string,
+  fields: Record<string, string>
+): Promise<BranchInfoRecord> {
+  const res = await fetch(`/api/branch-info/${encodeURIComponent(rowKey)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fields }),
+  });
+  if (!res.ok) {
+    await parseBranchJsonError(res, 'Failed to update branch.');
+  }
+  const data = (await res.json()) as { record: BranchInfoRecord };
+  return data.record;
+}
+
+export async function deleteBranchInfoRecord(rowKey: string): Promise<void> {
+  const res = await fetch(`/api/branch-info/${encodeURIComponent(rowKey)}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) {
+    await parseBranchJsonError(res, 'Failed to delete branch.');
+  }
+}
+
+export async function saveImportedBranchInfoDataset(payload: {
+  fileName: string;
+  sheetNames: string[];
+  columns: string[];
+  detectedColumns: DetectedBranchInfoColumns;
+  records: BranchInfoRecord[];
+  notes: string[];
+  importedAt: string;
+}): Promise<BranchInfoDataset> {
+  const res = await fetch('/api/branch-info/import', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    await parseBranchJsonError(res, 'Failed to save imported branch dataset.');
+  }
+  return (await res.json()) as BranchInfoDataset;
+}
+
 /**
  * Checks whether a value is a valid Google Maps URL or lat,lng coordinates.
  */

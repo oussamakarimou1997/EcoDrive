@@ -8,6 +8,7 @@ import {
   MapPin,
   Users,
   Building2,
+  Sparkles,
 } from 'lucide-react';
 import { ActiveTab } from './Header';
 import { DataSourceState } from '../types/pricing';
@@ -39,6 +40,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
       icon: <Bus className="w-4 h-4" />,
     },
     {
+      id: 'ai-transport-finder' as ActiveTab,
+      label: 'AI Smart Transportation Finder',
+      description: 'Nearest stop & live schedule',
+      icon: <Sparkles className="w-4 h-4" />,
+      badge: 'AI',
+    },
+    {
       id: 'branches' as ActiveTab,
       label: 'Branch and Location',
       description: '39 branches & live availability',
@@ -61,7 +69,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   return (
     <aside
-      className={`hidden lg:flex lg:flex-col bg-[#064E3B] text-white shrink-0 min-h-screen transition-all duration-300 relative border-r border-[#004d32] ${
+      className={`hidden lg:flex lg:flex-col bg-[#064E3B] dark:bg-[#042F24] text-white shrink-0 min-h-screen transition-all duration-300 relative border-r border-[#004d32] dark:border-emerald-950 ${
         isCollapsed ? 'w-20' : 'w-64'
       }`}
     >
