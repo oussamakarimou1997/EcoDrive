@@ -4,12 +4,18 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "tsx server.ts",
+    "dev": "node scripts/dev-cf.mjs",
     "build": "vite build",
-    "start": "node server.ts",
-    "preview": "vite preview",
-    "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "start": "npx wrangler dev --local --port 3000 --ip 0.0.0.0",
+    "preview": "npx wrangler dev --local",
+    "cf:dev": "npx wrangler dev --local",
+    "cf:deploy": "npx wrangler deploy",
+    "cf:typegen": "npx wrangler types",
+    "db:migrate:local": "npx wrangler d1 migrations apply ecodrive-db --local",
+    "db:migrate:remote": "npx wrangler d1 migrations apply ecodrive-db --remote",
+    "db:export-sqlite": "node scripts/export-sqlite-to-d1.mjs",
+    "clean": "rm -rf dist .wrangler-dryrun",
+    "lint": "tsc --noEmit && tsc -p tsconfig.worker.json --noEmit"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -17,8 +23,6 @@
     "@types/google.maps": "^3.67.0",
     "@vis.gl/react-google-maps": "^1.10.2",
     "@vitejs/plugin-react": "^6.1.1",
-    "dotenv": "^17.2.3",
-    "express": "^4.21.2",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
     "react": "^19.0.1",
@@ -27,6 +31,7 @@
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261124.1",
     "@types/node": "^22.14.0",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
@@ -35,6 +40,6 @@
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",
     "typescript": "^7.0.2",
-    "@types/express": "^4.17.21"
+    "wrangler": "^4.167.0"
   }
 }

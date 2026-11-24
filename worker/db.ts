@@ -1,33 +1,32 @@
-import fs from 'fs';
-import path from 'path';
-import crypto from 'crypto';
-import { fileURLToPath } from 'url';
-import { DatabaseSync } from 'node:sqlite';
 import {
   DEFAULT_INSTRUCTORS_COLUMNS,
   DEFAULT_INSTRUCTORS_FILE_NAME,
   DEFAULT_INSTRUCTORS_RECORDS,
-} from './src/data/instructorsData';
+} from '../src/data/instructorsData';
 import {
   DEFAULT_BRANCH_INFO_COLUMNS,
   DEFAULT_BRANCH_INFO_FILE_NAME,
   DEFAULT_BRANCH_INFO_NOTES,
   DEFAULT_BRANCH_INFO_RECORDS,
-} from './src/data/branchInfoData';
+} from '../src/data/branchInfoData';
 import {
   DetectedInstructorColumns,
   InstructorRecord,
   InstructorsDataset,
-} from './src/types/instructors';
+} from '../src/types/instructors';
 import {
   BranchInfoDataset,
   BranchInfoRecord,
   DetectedBranchInfoColumns,
   DynamicBranchFilterConfig,
-} from './src/types/branchInfo';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+} from '../src/types/branchInfo';
+import {
+  generateRandomHexToken,
+  hashAccessCodePbkdf2,
+  sha256Hex,
+  verifyAccessCodeHash,
+  verifyEnvAccessCodeConstantTime,
+} from './crypto';
 
 export class ValidationError extends Error {
   public fieldErrors: Record<string, string>;
@@ -59,6 +58,9 @@ export class ConflictError extends Error {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Column Detection & Dynamic Filter Config Builders (100% Preserved Logic)
+// ---------------------------------------------------------------------------
 function detectInstructorColumnsServer(columns: string[]): DetectedInstructorColumns {
   const findCol = (patterns: RegExp[]): string | null => {
     for (const pattern of patterns) {
@@ -203,167 +205,156 @@ function buildBranchFilterConfigsServer(
 }
 
 // ---------------------------------------------------------------------------
-// SQLite Initialization & Non-Destructive First-Run Seeding
+// Idempotent Non-Destructive First-Run Seeding for Cloudflare D1
 // ---------------------------------------------------------------------------
-const dataDir = path.join(__dirname, 'data');
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
+const SEED_BATCH_SIZE = 40;
+let instructorsSeedPromise: Promise<void> | null = null;
+let branchInfoSeedPromise: Promise<void> | null = null;
+
+async function executeChunkedBatch(
+  db: D1Database,
+  statements: D1PreparedStatement[],
+  chunkSize = SEED_BATCH_SIZE
+): Promise<void> {
+  for (let i = 0; i < statements.length; i += chunkSize) {
+    const slice = statements.slice(i, i + chunkSize);
+    if (slice.length > 0) {
+      await db.batch(slice);
+    }
+  }
 }
 
-const dbPath = path.join(dataDir, 'ecodrive.db');
-const db = new DatabaseSync(dbPath);
-db.exec('PRAGMA journal_mode = WAL;');
+export async function ensureInstructorsSeeded(db: D1Database): Promise<void> {
+  if (instructorsSeedPromise) {
+    return instructorsSeedPromise;
+  }
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS instructors_meta (
-    id TEXT PRIMARY KEY,
-    file_name TEXT NOT NULL,
-    sheet_names_json TEXT NOT NULL,
-    columns_json TEXT NOT NULL,
-    detected_columns_json TEXT NOT NULL,
-    is_default_source INTEGER NOT NULL DEFAULT 1,
-    imported_at TEXT NOT NULL
-  );
+  instructorsSeedPromise = (async () => {
+    const existingMeta = await db
+      .prepare('SELECT id FROM instructors_meta WHERE id = ?')
+      .bind('active')
+      .first<{ id: string }>();
 
-  CREATE TABLE IF NOT EXISTS instructors (
-    row_key TEXT PRIMARY KEY,
-    sheet_name TEXT NOT NULL DEFAULT 'Sheet1',
-    sort_order INTEGER NOT NULL,
-    fields_json TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
+    if (existingMeta) return;
 
-  CREATE TABLE IF NOT EXISTS branch_info_meta (
-    id TEXT PRIMARY KEY,
-    file_name TEXT NOT NULL,
-    sheet_names_json TEXT NOT NULL,
-    columns_json TEXT NOT NULL,
-    detected_columns_json TEXT NOT NULL,
-    notes_json TEXT NOT NULL,
-    is_default_source INTEGER NOT NULL DEFAULT 1,
-    imported_at TEXT NOT NULL
-  );
+    // Extra safety: never overwrite if rows already exist from a manual import/migration
+    const existingCount = await db
+      .prepare('SELECT COUNT(*) AS cnt FROM instructors')
+      .first<{ cnt: number }>();
 
-  CREATE TABLE IF NOT EXISTS branch_info (
-    row_key TEXT PRIMARY KEY,
-    sheet_name TEXT NOT NULL DEFAULT 'Sheet1',
-    sort_order INTEGER NOT NULL,
-    fields_json TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
+    const detected = detectInstructorColumnsServer(DEFAULT_INSTRUCTORS_COLUMNS);
+    const now = new Date().toISOString();
 
-  CREATE TABLE IF NOT EXISTS admin_auth (
-    id TEXT PRIMARY KEY,
-    password_hash TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
+    await db
+      .prepare(
+        `INSERT OR IGNORE INTO instructors_meta
+         (id, file_name, sheet_names_json, columns_json, detected_columns_json, is_default_source, imported_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        'active',
+        DEFAULT_INSTRUCTORS_FILE_NAME,
+        JSON.stringify(['Sheet1']),
+        JSON.stringify(DEFAULT_INSTRUCTORS_COLUMNS),
+        JSON.stringify(detected),
+        1,
+        'Database Synced (Initial Source File)'
+      )
+      .run();
 
-  CREATE TABLE IF NOT EXISTS admin_sessions (
-    token_hash TEXT PRIMARY KEY,
-    created_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL
-  );
-`);
+    if ((existingCount?.cnt ?? 0) > 0) {
+      return;
+    }
 
-function seedInstructorsIfEmpty() {
-  const existingMeta = db
-    .prepare('SELECT id FROM instructors_meta WHERE id = ?')
-    .get('active');
-  if (existingMeta) return;
-
-  const detected = detectInstructorColumnsServer(DEFAULT_INSTRUCTORS_COLUMNS);
-  const now = new Date().toISOString();
-
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    db.prepare(
-      `INSERT INTO instructors_meta (id, file_name, sheet_names_json, columns_json, detected_columns_json, is_default_source, imported_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      'active',
-      DEFAULT_INSTRUCTORS_FILE_NAME,
-      JSON.stringify(['Sheet1']),
-      JSON.stringify(DEFAULT_INSTRUCTORS_COLUMNS),
-      JSON.stringify(detected),
-      1,
-      'Database Synced (Initial Source File)'
-    );
-
-    const insertRow = db.prepare(
-      `INSERT INTO instructors (row_key, sheet_name, sort_order, fields_json, created_at, updated_at)
+    const insertStmt = db.prepare(
+      `INSERT OR IGNORE INTO instructors (row_key, sheet_name, sort_order, fields_json, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?)`
     );
 
-    DEFAULT_INSTRUCTORS_RECORDS.forEach((rec, index) => {
-      insertRow.run(
+    const rowStmts = DEFAULT_INSTRUCTORS_RECORDS.map((rec, index) =>
+      insertStmt.bind(
         rec._rowKey,
         rec._sheetName || 'Sheet1',
         index + 1,
         JSON.stringify(rec.fields),
         now,
         now
-      );
-    });
-
-    db.exec('COMMIT');
-  } catch (err) {
-    db.exec('ROLLBACK');
-    throw err;
-  }
-}
-
-function seedBranchInfoIfEmpty() {
-  const existingMeta = db
-    .prepare('SELECT id FROM branch_info_meta WHERE id = ?')
-    .get('active');
-  if (existingMeta) return;
-
-  const detected = detectBranchInfoColumnsServer(DEFAULT_BRANCH_INFO_COLUMNS);
-  const now = new Date().toISOString();
-
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    db.prepare(
-      `INSERT INTO branch_info_meta (id, file_name, sheet_names_json, columns_json, detected_columns_json, notes_json, is_default_source, imported_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      'active',
-      DEFAULT_BRANCH_INFO_FILE_NAME,
-      JSON.stringify(['Sheet1']),
-      JSON.stringify(DEFAULT_BRANCH_INFO_COLUMNS),
-      JSON.stringify(detected),
-      JSON.stringify(DEFAULT_BRANCH_INFO_NOTES),
-      1,
-      'Database Synced (Initial Source File)'
+      )
     );
 
-    const insertRow = db.prepare(
-      `INSERT INTO branch_info (row_key, sheet_name, sort_order, fields_json, created_at, updated_at)
+    await executeChunkedBatch(db, rowStmts);
+  })().finally(() => {
+    instructorsSeedPromise = null;
+  });
+
+  return instructorsSeedPromise;
+}
+
+export async function ensureBranchInfoSeeded(db: D1Database): Promise<void> {
+  if (branchInfoSeedPromise) {
+    return branchInfoSeedPromise;
+  }
+
+  branchInfoSeedPromise = (async () => {
+    const existingMeta = await db
+      .prepare('SELECT id FROM branch_info_meta WHERE id = ?')
+      .bind('active')
+      .first<{ id: string }>();
+
+    if (existingMeta) return;
+
+    const existingCount = await db
+      .prepare('SELECT COUNT(*) AS cnt FROM branch_info')
+      .first<{ cnt: number }>();
+
+    const detected = detectBranchInfoColumnsServer(DEFAULT_BRANCH_INFO_COLUMNS);
+    const now = new Date().toISOString();
+
+    await db
+      .prepare(
+        `INSERT OR IGNORE INTO branch_info_meta
+         (id, file_name, sheet_names_json, columns_json, detected_columns_json, notes_json, is_default_source, imported_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        'active',
+        DEFAULT_BRANCH_INFO_FILE_NAME,
+        JSON.stringify(['Sheet1']),
+        JSON.stringify(DEFAULT_BRANCH_INFO_COLUMNS),
+        JSON.stringify(detected),
+        JSON.stringify(DEFAULT_BRANCH_INFO_NOTES),
+        1,
+        'Database Synced (Initial Source File)'
+      )
+      .run();
+
+    if ((existingCount?.cnt ?? 0) > 0) {
+      return;
+    }
+
+    const insertStmt = db.prepare(
+      `INSERT OR IGNORE INTO branch_info (row_key, sheet_name, sort_order, fields_json, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?)`
     );
 
-    DEFAULT_BRANCH_INFO_RECORDS.forEach((rec, index) => {
-      insertRow.run(
+    const rowStmts = DEFAULT_BRANCH_INFO_RECORDS.map((rec, index) =>
+      insertStmt.bind(
         rec._rowKey,
         rec._sheetName || 'Sheet1',
         index + 1,
         JSON.stringify(rec.fields),
         now,
         now
-      );
-    });
+      )
+    );
 
-    db.exec('COMMIT');
-  } catch (err) {
-    db.exec('ROLLBACK');
-    throw err;
-  }
+    await executeChunkedBatch(db, rowStmts);
+  })().finally(() => {
+    branchInfoSeedPromise = null;
+  });
+
+  return branchInfoSeedPromise;
 }
-
-seedInstructorsIfEmpty();
-seedBranchInfoIfEmpty();
 
 // ---------------------------------------------------------------------------
 // Validation Helpers
@@ -400,27 +391,36 @@ function isValidMapValue(val: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Instructors CRUD Operations
+// Instructors CRUD Operations (Cloudflare D1)
 // ---------------------------------------------------------------------------
-export function getInstructorsDatasetFromDb(): InstructorsDataset {
-  const metaRow = db
-    .prepare('SELECT * FROM instructors_meta WHERE id = ?')
-    .get('active') as {
-    file_name: string;
-    sheet_names_json: string;
-    columns_json: string;
-    detected_columns_json: string;
-    is_default_source: number;
-    imported_at: string;
-  };
+export async function getInstructorsDatasetFromDb(db: D1Database): Promise<InstructorsDataset> {
+  await ensureInstructorsSeeded(db);
 
-  const rows = db
+  const metaRow = await db
+    .prepare('SELECT * FROM instructors_meta WHERE id = ?')
+    .bind('active')
+    .first<{
+      file_name: string;
+      sheet_names_json: string;
+      columns_json: string;
+      detected_columns_json: string;
+      is_default_source: number;
+      imported_at: string;
+    }>();
+
+  if (!metaRow) {
+    throw new Error('Instructors metadata record is missing from D1 database.');
+  }
+
+  const rowsResult = await db
     .prepare('SELECT row_key, sheet_name, fields_json FROM instructors ORDER BY sort_order ASC')
-    .all() as Array<{
-    row_key: string;
-    sheet_name: string;
-    fields_json: string;
-  }>;
+    .all<{
+      row_key: string;
+      sheet_name: string;
+      fields_json: string;
+    }>();
+
+  const rows = rowsResult.results || [];
 
   return {
     fileName: metaRow.file_name,
@@ -498,26 +498,30 @@ function validateInstructorFields(
   }
 }
 
-export function createInstructorInDb(
+export async function createInstructorInDb(
+  db: D1Database,
   rawFields: Record<string, unknown>,
   sheetName = 'Sheet1'
-): InstructorRecord {
-  const dataset = getInstructorsDatasetFromDb();
+): Promise<InstructorRecord> {
+  const dataset = await getInstructorsDatasetFromDb(db);
   const cleanFields = normalizeFields(rawFields, dataset.columns);
   validateInstructorFields(cleanFields, dataset);
 
-  const maxOrderRow = db
+  const maxOrderRow = await db
     .prepare('SELECT COALESCE(MAX(sort_order), 0) AS max_order FROM instructors')
-    .get() as { max_order: number };
+    .first<{ max_order: number }>();
   const nextOrder = (maxOrderRow?.max_order || 0) + 1;
 
-  const rowKey = `inst-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const rowKey = `inst-${Date.now()}-${generateRandomHexToken(4)}`;
   const now = new Date().toISOString();
 
-  db.prepare(
-    `INSERT INTO instructors (row_key, sheet_name, sort_order, fields_json, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?)`
-  ).run(rowKey, sheetName || 'Sheet1', nextOrder, JSON.stringify(cleanFields), now, now);
+  await db
+    .prepare(
+      `INSERT INTO instructors (row_key, sheet_name, sort_order, fields_json, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+    .bind(rowKey, sheetName || 'Sheet1', nextOrder, JSON.stringify(cleanFields), now, now)
+    .run();
 
   return {
     _rowKey: rowKey,
@@ -526,28 +530,31 @@ export function createInstructorInDb(
   };
 }
 
-export function updateInstructorInDb(
+export async function updateInstructorInDb(
+  db: D1Database,
   rowKey: string,
   rawFields: Record<string, unknown>
-): InstructorRecord {
-  const existing = db
+): Promise<InstructorRecord> {
+  await ensureInstructorsSeeded(db);
+
+  const existing = await db
     .prepare('SELECT row_key, sheet_name FROM instructors WHERE row_key = ?')
-    .get(rowKey) as { row_key: string; sheet_name: string } | undefined;
+    .bind(rowKey)
+    .first<{ row_key: string; sheet_name: string }>();
 
   if (!existing) {
     throw new NotFoundError('Instructor record was not found.');
   }
 
-  const dataset = getInstructorsDatasetFromDb();
+  const dataset = await getInstructorsDatasetFromDb(db);
   const cleanFields = normalizeFields(rawFields, dataset.columns);
   validateInstructorFields(cleanFields, dataset, rowKey);
 
   const now = new Date().toISOString();
-  db.prepare('UPDATE instructors SET fields_json = ?, updated_at = ? WHERE row_key = ?').run(
-    JSON.stringify(cleanFields),
-    now,
-    rowKey
-  );
+  await db
+    .prepare('UPDATE instructors SET fields_json = ?, updated_at = ? WHERE row_key = ?')
+    .bind(JSON.stringify(cleanFields), now, rowKey)
+    .run();
 
   return {
     _rowKey: rowKey,
@@ -556,33 +563,44 @@ export function updateInstructorInDb(
   };
 }
 
-export function deleteInstructorInDb(rowKey: string): void {
-  const result = db.prepare('DELETE FROM instructors WHERE row_key = ?').run(rowKey);
-  if (result.changes === 0) {
+export async function deleteInstructorInDb(db: D1Database, rowKey: string): Promise<void> {
+  await ensureInstructorsSeeded(db);
+
+  const result = await db
+    .prepare('DELETE FROM instructors WHERE row_key = ?')
+    .bind(rowKey)
+    .run();
+
+  if (!result.meta || result.meta.changes === 0) {
     throw new NotFoundError('Instructor record was not found.');
   }
 }
 
-export function replaceInstructorsDatasetInDb(payload: {
-  fileName: string;
-  sheetNames: string[];
-  columns: string[];
-  detectedColumns: DetectedInstructorColumns;
-  records: InstructorRecord[];
-  importedAt: string;
-}): InstructorsDataset {
-  if (!payload.columns?.length || !payload.records?.length) {
+export async function replaceInstructorsDatasetInDb(
+  db: D1Database,
+  payload: {
+    fileName: string;
+    sheetNames: string[];
+    columns: string[];
+    detectedColumns: DetectedInstructorColumns;
+    records: InstructorRecord[];
+    importedAt: string;
+  }
+): Promise<InstructorsDataset> {
+  if (!payload?.columns?.length || !payload?.records?.length) {
     throw new ValidationError('Imported instructors dataset must include columns and records.');
   }
 
+  await ensureInstructorsSeeded(db);
+
   const now = new Date().toISOString();
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    db.prepare(
+  const updateMetaStmt = db
+    .prepare(
       `UPDATE instructors_meta
        SET file_name = ?, sheet_names_json = ?, columns_json = ?, detected_columns_json = ?, is_default_source = 0, imported_at = ?
        WHERE id = 'active'`
-    ).run(
+    )
+    .bind(
       payload.fileName,
       JSON.stringify(payload.sheetNames),
       JSON.stringify(payload.columns),
@@ -590,62 +608,67 @@ export function replaceInstructorsDatasetInDb(payload: {
       payload.importedAt || now
     );
 
-    db.prepare('DELETE FROM instructors').run();
+  const deleteAllStmt = db.prepare('DELETE FROM instructors');
 
-    const insertRow = db.prepare(
-      `INSERT INTO instructors (row_key, sheet_name, sort_order, fields_json, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    );
+  const insertRowTemplate = db.prepare(
+    `INSERT INTO instructors (row_key, sheet_name, sort_order, fields_json, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  );
 
-    payload.records.forEach((rec, index) => {
-      insertRow.run(
-        rec._rowKey || `imp-${index + 1}`,
-        rec._sheetName || 'Sheet1',
-        index + 1,
-        JSON.stringify(rec.fields),
-        now,
-        now
-      );
-    });
+  const rowStmts = payload.records.map((rec, index) =>
+    insertRowTemplate.bind(
+      rec._rowKey || `imp-${index + 1}`,
+      rec._sheetName || 'Sheet1',
+      index + 1,
+      JSON.stringify(rec.fields),
+      now,
+      now
+    )
+  );
 
-    db.exec('COMMIT');
-  } catch (err) {
-    db.exec('ROLLBACK');
-    throw err;
-  }
+  // Execute in one atomic D1 batch transaction
+  await db.batch([updateMetaStmt, deleteAllStmt, ...rowStmts]);
 
-  return getInstructorsDatasetFromDb();
+  return getInstructorsDatasetFromDb(db);
 }
 
 // ---------------------------------------------------------------------------
-// Branch Information CRUD Operations
+// Branch Information CRUD Operations (Cloudflare D1)
 // ---------------------------------------------------------------------------
-export function getBranchInfoDatasetFromDb(): BranchInfoDataset {
-  const metaRow = db
+export async function getBranchInfoDatasetFromDb(db: D1Database): Promise<BranchInfoDataset> {
+  await ensureBranchInfoSeeded(db);
+
+  const metaRow = await db
     .prepare('SELECT * FROM branch_info_meta WHERE id = ?')
-    .get('active') as {
-    file_name: string;
-    sheet_names_json: string;
-    columns_json: string;
-    detected_columns_json: string;
-    notes_json: string;
-    is_default_source: number;
-    imported_at: string;
-  };
+    .bind('active')
+    .first<{
+      file_name: string;
+      sheet_names_json: string;
+      columns_json: string;
+      detected_columns_json: string;
+      notes_json: string;
+      is_default_source: number;
+      imported_at: string;
+    }>();
+
+  if (!metaRow) {
+    throw new Error('Branch information metadata record is missing from D1 database.');
+  }
 
   const columns = JSON.parse(metaRow.columns_json) as string[];
   const detectedColumns = JSON.parse(
     metaRow.detected_columns_json
   ) as DetectedBranchInfoColumns;
 
-  const rows = db
+  const rowsResult = await db
     .prepare('SELECT row_key, sheet_name, fields_json FROM branch_info ORDER BY sort_order ASC')
-    .all() as Array<{
-    row_key: string;
-    sheet_name: string;
-    fields_json: string;
-  }>;
+    .all<{
+      row_key: string;
+      sheet_name: string;
+      fields_json: string;
+    }>();
 
+  const rows = rowsResult.results || [];
   const records: BranchInfoRecord[] = rows.map((r) => ({
     _rowKey: r.row_key,
     _sheetName: r.sheet_name,
@@ -745,26 +768,30 @@ function validateBranchInfoFields(
   }
 }
 
-export function createBranchInfoInDb(
+export async function createBranchInfoInDb(
+  db: D1Database,
   rawFields: Record<string, unknown>,
   sheetName = 'Sheet1'
-): BranchInfoRecord {
-  const dataset = getBranchInfoDatasetFromDb();
+): Promise<BranchInfoRecord> {
+  const dataset = await getBranchInfoDatasetFromDb(db);
   const cleanFields = normalizeFields(rawFields, dataset.columns);
   validateBranchInfoFields(cleanFields, dataset);
 
-  const maxOrderRow = db
+  const maxOrderRow = await db
     .prepare('SELECT COALESCE(MAX(sort_order), 0) AS max_order FROM branch_info')
-    .get() as { max_order: number };
+    .first<{ max_order: number }>();
   const nextOrder = (maxOrderRow?.max_order || 0) + 1;
 
-  const rowKey = `branch-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const rowKey = `branch-${Date.now()}-${generateRandomHexToken(4)}`;
   const now = new Date().toISOString();
 
-  db.prepare(
-    `INSERT INTO branch_info (row_key, sheet_name, sort_order, fields_json, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?)`
-  ).run(rowKey, sheetName || 'Sheet1', nextOrder, JSON.stringify(cleanFields), now, now);
+  await db
+    .prepare(
+      `INSERT INTO branch_info (row_key, sheet_name, sort_order, fields_json, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+    .bind(rowKey, sheetName || 'Sheet1', nextOrder, JSON.stringify(cleanFields), now, now)
+    .run();
 
   return {
     _rowKey: rowKey,
@@ -773,28 +800,31 @@ export function createBranchInfoInDb(
   };
 }
 
-export function updateBranchInfoInDb(
+export async function updateBranchInfoInDb(
+  db: D1Database,
   rowKey: string,
   rawFields: Record<string, unknown>
-): BranchInfoRecord {
-  const existing = db
+): Promise<BranchInfoRecord> {
+  await ensureBranchInfoSeeded(db);
+
+  const existing = await db
     .prepare('SELECT row_key, sheet_name FROM branch_info WHERE row_key = ?')
-    .get(rowKey) as { row_key: string; sheet_name: string } | undefined;
+    .bind(rowKey)
+    .first<{ row_key: string; sheet_name: string }>();
 
   if (!existing) {
     throw new NotFoundError('Branch record was not found.');
   }
 
-  const dataset = getBranchInfoDatasetFromDb();
+  const dataset = await getBranchInfoDatasetFromDb(db);
   const cleanFields = normalizeFields(rawFields, dataset.columns);
   validateBranchInfoFields(cleanFields, dataset, rowKey);
 
   const now = new Date().toISOString();
-  db.prepare('UPDATE branch_info SET fields_json = ?, updated_at = ? WHERE row_key = ?').run(
-    JSON.stringify(cleanFields),
-    now,
-    rowKey
-  );
+  await db
+    .prepare('UPDATE branch_info SET fields_json = ?, updated_at = ? WHERE row_key = ?')
+    .bind(JSON.stringify(cleanFields), now, rowKey)
+    .run();
 
   return {
     _rowKey: rowKey,
@@ -803,34 +833,45 @@ export function updateBranchInfoInDb(
   };
 }
 
-export function deleteBranchInfoInDb(rowKey: string): void {
-  const result = db.prepare('DELETE FROM branch_info WHERE row_key = ?').run(rowKey);
-  if (result.changes === 0) {
+export async function deleteBranchInfoInDb(db: D1Database, rowKey: string): Promise<void> {
+  await ensureBranchInfoSeeded(db);
+
+  const result = await db
+    .prepare('DELETE FROM branch_info WHERE row_key = ?')
+    .bind(rowKey)
+    .run();
+
+  if (!result.meta || result.meta.changes === 0) {
     throw new NotFoundError('Branch record was not found.');
   }
 }
 
-export function replaceBranchInfoDatasetInDb(payload: {
-  fileName: string;
-  sheetNames: string[];
-  columns: string[];
-  detectedColumns: DetectedBranchInfoColumns;
-  records: BranchInfoRecord[];
-  notes: string[];
-  importedAt: string;
-}): BranchInfoDataset {
-  if (!payload.columns?.length || !payload.records?.length) {
+export async function replaceBranchInfoDatasetInDb(
+  db: D1Database,
+  payload: {
+    fileName: string;
+    sheetNames: string[];
+    columns: string[];
+    detectedColumns: DetectedBranchInfoColumns;
+    records: BranchInfoRecord[];
+    notes: string[];
+    importedAt: string;
+  }
+): Promise<BranchInfoDataset> {
+  if (!payload?.columns?.length || !payload?.records?.length) {
     throw new ValidationError('Imported branch dataset must include columns and records.');
   }
 
+  await ensureBranchInfoSeeded(db);
+
   const now = new Date().toISOString();
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    db.prepare(
+  const updateMetaStmt = db
+    .prepare(
       `UPDATE branch_info_meta
        SET file_name = ?, sheet_names_json = ?, columns_json = ?, detected_columns_json = ?, notes_json = ?, is_default_source = 0, imported_at = ?
        WHERE id = 'active'`
-    ).run(
+    )
+    .bind(
       payload.fileName,
       JSON.stringify(payload.sheetNames),
       JSON.stringify(payload.columns),
@@ -839,105 +880,86 @@ export function replaceBranchInfoDatasetInDb(payload: {
       payload.importedAt || now
     );
 
-    db.prepare('DELETE FROM branch_info').run();
+  const deleteAllStmt = db.prepare('DELETE FROM branch_info');
 
-    const insertRow = db.prepare(
-      `INSERT INTO branch_info (row_key, sheet_name, sort_order, fields_json, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    );
+  const insertRowTemplate = db.prepare(
+    `INSERT INTO branch_info (row_key, sheet_name, sort_order, fields_json, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  );
 
-    payload.records.forEach((rec, index) => {
-      insertRow.run(
-        rec._rowKey || `bimp-${index + 1}`,
-        rec._sheetName || 'Sheet1',
-        index + 1,
-        JSON.stringify(rec.fields),
-        now,
-        now
-      );
-    });
+  const rowStmts = payload.records.map((rec, index) =>
+    insertRowTemplate.bind(
+      rec._rowKey || `bimp-${index + 1}`,
+      rec._sheetName || 'Sheet1',
+      index + 1,
+      JSON.stringify(rec.fields),
+      now,
+      now
+    )
+  );
 
-    db.exec('COMMIT');
-  } catch (err) {
-    db.exec('ROLLBACK');
-    throw err;
-  }
+  await db.batch([updateMetaStmt, deleteAllStmt, ...rowStmts]);
 
-  return getBranchInfoDatasetFromDb();
+  return getBranchInfoDatasetFromDb(db);
 }
 
 // ---------------------------------------------------------------------------
-// Admin Access Code Authentication & Short-Lived Sessions
+// Admin Access Code Authentication, Sessions & D1 Rate Limiting
 // ---------------------------------------------------------------------------
-const ADMIN_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes temporary authorization
+const ADMIN_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const MAX_VERIFY_FAILURES = 5;
+const VERIFY_LOCKOUT_MS = 30 * 1000;
 
-function hashAccessCodeScrypt(accessCode: string): string {
-  const salt = crypto.randomBytes(16).toString('hex');
-  const derived = crypto.scryptSync(accessCode, salt, 64).toString('hex');
-  return `${salt}:${derived}`;
+function normalizeEnvAdminAccessCode(envAdminCode?: string): string {
+  return (envAdminCode || '').trim();
 }
 
-function verifyAccessCodeScrypt(accessCode: string, storedHash: string): boolean {
-  const parts = storedHash.split(':');
-  if (parts.length !== 2) return false;
-  const [salt, expectedHex] = parts;
-  if (!salt || !expectedHex) return false;
-  const derived = crypto.scryptSync(accessCode, salt, 64);
-  const expectedBuf = Buffer.from(expectedHex, 'hex');
-  if (derived.length !== expectedBuf.length) return false;
-  return crypto.timingSafeEqual(derived, expectedBuf);
-}
-
-function verifyEnvAccessCodeConstantTime(inputCode: string, envCode: string): boolean {
-  const a = crypto.createHash('sha256').update(inputCode, 'utf8').digest();
-  const b = crypto.createHash('sha256').update(envCode, 'utf8').digest();
-  return crypto.timingSafeEqual(a, b);
-}
-
-function sha256Token(token: string): string {
-  return crypto.createHash('sha256').update(token, 'utf8').digest('hex');
-}
-
-function pruneExpiredSessions() {
+async function pruneExpiredSessions(db: D1Database): Promise<void> {
   const nowIso = new Date().toISOString();
-  db.prepare('DELETE FROM admin_sessions WHERE expires_at <= ?').run(nowIso);
+  await db.prepare('DELETE FROM admin_sessions WHERE expires_at <= ?').bind(nowIso).run();
 }
 
-function createAdminSession(): { token: string; expiresAt: string } {
-  pruneExpiredSessions();
-  const token = crypto.randomBytes(32).toString('hex');
-  const tokenHash = sha256Token(token);
+async function createAdminSession(
+  db: D1Database
+): Promise<{ token: string; expiresAt: string }> {
+  await pruneExpiredSessions(db);
+  const token = generateRandomHexToken(32);
+  const tokenHash = await sha256Hex(token);
   const now = new Date();
   const expiresAt = new Date(now.getTime() + ADMIN_SESSION_TTL_MS).toISOString();
 
-  db.prepare(
-    `INSERT INTO admin_sessions (token_hash, created_at, expires_at)
-     VALUES (?, ?, ?)`
-  ).run(tokenHash, now.toISOString(), expiresAt);
+  await db
+    .prepare(
+      `INSERT INTO admin_sessions (token_hash, created_at, expires_at)
+       VALUES (?, ?, ?)`
+    )
+    .bind(tokenHash, now.toISOString(), expiresAt)
+    .run();
 
   return { token, expiresAt };
 }
 
-function getEnvAdminAccessCode(): string {
-  return (process.env.ADMIN_ACCESS_CODE || '').trim();
-}
-
-export function getAdminAuthStatus(): { configured: boolean; managedByEnv: boolean } {
-  const envCode = getEnvAdminAccessCode();
+export async function getAdminAuthStatus(
+  db: D1Database,
+  envAdminCode?: string
+): Promise<{ configured: boolean; managedByEnv: boolean }> {
+  const envCode = normalizeEnvAdminAccessCode(envAdminCode);
   if (envCode) {
     return { configured: true, managedByEnv: true };
   }
-  const row = db
+  const row = await db
     .prepare('SELECT id FROM admin_auth WHERE id = ?')
-    .get('primary') as { id: string } | undefined;
+    .bind('primary')
+    .first<{ id: string }>();
   return { configured: Boolean(row), managedByEnv: false };
 }
 
-export function setupInitialAdminAccessCode(rawCode: unknown): {
-  token: string;
-  expiresAt: string;
-} {
-  if (getEnvAdminAccessCode()) {
+export async function setupInitialAdminAccessCode(
+  db: D1Database,
+  rawCode: unknown,
+  envAdminCode?: string
+): Promise<{ token: string; expiresAt: string }> {
+  if (normalizeEnvAdminAccessCode(envAdminCode)) {
     throw new ConflictError('Admin Access Code is already configured via environment secret.');
   }
 
@@ -948,98 +970,150 @@ export function setupInitialAdminAccessCode(rawCode: unknown): {
     });
   }
 
-  const hash = hashAccessCodeScrypt(code);
+  const hash = await hashAccessCodePbkdf2(code);
   const now = new Date().toISOString();
 
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    const existing = db
-      .prepare('SELECT id FROM admin_auth WHERE id = ?')
-      .get('primary') as { id: string } | undefined;
-
-    if (existing) {
-      db.exec('ROLLBACK');
-      throw new ConflictError('Admin Access Code has already been configured.');
-    }
-
-    db.prepare(
-      `INSERT INTO admin_auth (id, password_hash, updated_at)
+  // Atomic one-time insert via INSERT OR IGNORE
+  const insertResult = await db
+    .prepare(
+      `INSERT OR IGNORE INTO admin_auth (id, password_hash, updated_at)
        VALUES (?, ?, ?)`
-    ).run('primary', hash, now);
+    )
+    .bind('primary', hash, now)
+    .run();
 
-    db.exec('COMMIT');
-  } catch (err) {
-    try {
-      db.exec('ROLLBACK');
-    } catch {
-      // ignore if already rolled back
-    }
-    throw err;
+  if (!insertResult.meta || insertResult.meta.changes === 0) {
+    throw new ConflictError('Admin Access Code has already been configured.');
   }
 
-  return createAdminSession();
+  return createAdminSession(db);
 }
 
-export function verifyAdminAccessCodeAndCreateSession(rawCode: unknown): {
-  token: string;
-  expiresAt: string;
-} {
+export async function checkVerifyRateLimit(
+  db: D1Database,
+  clientKey: string
+): Promise<number> {
+  const now = Date.now();
+  const record = await db
+    .prepare('SELECT fail_count, blocked_until FROM admin_rate_limits WHERE client_key = ?')
+    .bind(clientKey)
+    .first<{ fail_count: number; blocked_until: number }>();
+
+  if (record && record.blocked_until > now) {
+    return Math.ceil((record.blocked_until - now) / 1000);
+  }
+  return 0;
+}
+
+export async function clearVerifyRateLimit(db: D1Database, clientKey: string): Promise<void> {
+  await db
+    .prepare('DELETE FROM admin_rate_limits WHERE client_key = ?')
+    .bind(clientKey)
+    .run();
+}
+
+export async function recordVerifyFailure(db: D1Database, clientKey: string): Promise<void> {
+  const now = Date.now();
+  const record = await db
+    .prepare('SELECT fail_count, blocked_until FROM admin_rate_limits WHERE client_key = ?')
+    .bind(clientKey)
+    .first<{ fail_count: number; blocked_until: number }>();
+
+  const prevCount = record && record.blocked_until <= now ? record.fail_count : 0;
+  const nextCount = prevCount + 1;
+
+  const newFailCount = nextCount >= MAX_VERIFY_FAILURES ? 0 : nextCount;
+  const newBlockedUntil = nextCount >= MAX_VERIFY_FAILURES ? now + VERIFY_LOCKOUT_MS : 0;
+
+  await db
+    .prepare(
+      `INSERT INTO admin_rate_limits (client_key, fail_count, blocked_until)
+       VALUES (?, ?, ?)
+       ON CONFLICT(client_key) DO UPDATE SET
+         fail_count = excluded.fail_count,
+         blocked_until = excluded.blocked_until`
+    )
+    .bind(clientKey, newFailCount, newBlockedUntil)
+    .run();
+}
+
+export async function verifyAdminAccessCodeAndCreateSession(
+  db: D1Database,
+  rawCode: unknown,
+  envAdminCode?: string
+): Promise<{ token: string; expiresAt: string }> {
   const code = typeof rawCode === 'string' ? rawCode.trim() : '';
   if (!code) {
     throw new UnauthorizedError('Access denied. Invalid Admin Access Code.');
   }
 
-  const envCode = getEnvAdminAccessCode();
+  const envCode = normalizeEnvAdminAccessCode(envAdminCode);
   if (envCode) {
-    if (!verifyEnvAccessCodeConstantTime(code, envCode)) {
+    const valid = await verifyEnvAccessCodeConstantTime(code, envCode);
+    if (!valid) {
       throw new UnauthorizedError('Access denied. Invalid Admin Access Code.');
     }
-    return createAdminSession();
+    return createAdminSession(db);
   }
 
-  const row = db
+  const row = await db
     .prepare('SELECT password_hash FROM admin_auth WHERE id = ?')
-    .get('primary') as { password_hash: string } | undefined;
+    .bind('primary')
+    .first<{ password_hash: string }>();
 
   if (!row) {
     throw new ValidationError('Admin Access Code is not set up yet. Please configure one first.');
   }
 
-  if (!verifyAccessCodeScrypt(code, row.password_hash)) {
+  const valid = await verifyAccessCodeHash(code, row.password_hash);
+  if (!valid) {
     throw new UnauthorizedError('Access denied. Invalid Admin Access Code.');
   }
 
-  return createAdminSession();
+  return createAdminSession(db);
 }
 
-export function validateAdminSessionToken(token: string | null | undefined): boolean {
+export async function validateAdminSessionToken(
+  db: D1Database,
+  token: string | null | undefined,
+  envAdminCode?: string
+): Promise<boolean> {
   if (!token || typeof token !== 'string') return false;
   const trimmed = token.trim();
   if (!trimmed) return false;
 
-  const { configured } = getAdminAuthStatus();
+  const { configured } = await getAdminAuthStatus(db, envAdminCode);
   if (!configured) return false;
 
-  const tokenHash = sha256Token(trimmed);
+  const tokenHash = await sha256Hex(trimmed);
   const nowIso = new Date().toISOString();
-  const row = db
+  const row = await db
     .prepare('SELECT token_hash FROM admin_sessions WHERE token_hash = ? AND expires_at > ?')
-    .get(tokenHash, nowIso) as { token_hash: string } | undefined;
+    .bind(tokenHash, nowIso)
+    .first<{ token_hash: string }>();
 
   return Boolean(row);
 }
 
-export function revokeAdminSessionToken(token: string | null | undefined): void {
+export async function revokeAdminSessionToken(
+  db: D1Database,
+  token: string | null | undefined
+): Promise<void> {
   if (!token || typeof token !== 'string') return;
-  const tokenHash = sha256Token(token.trim());
-  db.prepare('DELETE FROM admin_sessions WHERE token_hash = ?').run(tokenHash);
+  const tokenHash = await sha256Hex(token.trim());
+  await db
+    .prepare('DELETE FROM admin_sessions WHERE token_hash = ?')
+    .bind(tokenHash)
+    .run();
 }
 
-export function changeAdminAccessCode(
+export async function changeAdminAccessCode(
+  db: D1Database,
   rawCurrentCode: unknown,
-  rawNewCode: unknown
-): { token: string; expiresAt: string } {
-  if (getEnvAdminAccessCode()) {
+  rawNewCode: unknown,
+  envAdminCode?: string
+): Promise<{ token: string; expiresAt: string }> {
+  if (normalizeEnvAdminAccessCode(envAdminCode)) {
     throw new ValidationError(
       'Admin Access Code is managed by the server ADMIN_ACCESS_CODE environment secret.'
     );
@@ -1064,36 +1138,29 @@ export function changeAdminAccessCode(
     });
   }
 
-  const row = db
+  const row = await db
     .prepare('SELECT password_hash FROM admin_auth WHERE id = ?')
-    .get('primary') as { password_hash: string } | undefined;
+    .bind('primary')
+    .first<{ password_hash: string }>();
 
   if (!row) {
     throw new ValidationError('Admin Access Code has not been configured yet.');
   }
 
-  if (!verifyAccessCodeScrypt(currentCode, row.password_hash)) {
+  const valid = await verifyAccessCodeHash(currentCode, row.password_hash);
+  if (!valid) {
     throw new UnauthorizedError('Access denied. Invalid Admin Access Code.');
   }
 
-  const nextHash = hashAccessCodeScrypt(newCode);
+  const nextHash = await hashAccessCodePbkdf2(newCode);
   const now = new Date().toISOString();
 
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    db.prepare('UPDATE admin_auth SET password_hash = ?, updated_at = ? WHERE id = ?').run(
-      nextHash,
-      now,
-      'primary'
-    );
-    // Invalidate all prior temporary sessions after access code change
-    db.prepare('DELETE FROM admin_sessions').run();
-    db.exec('COMMIT');
-  } catch (err) {
-    db.exec('ROLLBACK');
-    throw err;
-  }
+  await db.batch([
+    db
+      .prepare('UPDATE admin_auth SET password_hash = ?, updated_at = ? WHERE id = ?')
+      .bind(nextHash, now, 'primary'),
+    db.prepare('DELETE FROM admin_sessions'),
+  ]);
 
-  return createAdminSession();
+  return createAdminSession(db);
 }
-

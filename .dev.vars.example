@@ -1,0 +1,5 @@
+# Local Cloudflare Workers development secrets (copy to .dev.vars; never commit .dev.vars)
+GEMINI_API_KEY=
+GOOGLE_MAPS_API_KEY=
+VITE_GOOGLE_MAPS_API_KEY=
+ADMIN_ACCESS_CODE=
