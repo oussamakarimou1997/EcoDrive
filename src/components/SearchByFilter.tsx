@@ -77,7 +77,7 @@ export const SearchByFilter: React.FC<SearchByFilterProps> = ({
     return allServiceNames.filter((name) => name.toLowerCase().includes(term));
   }, [allServiceNames, serviceSearchTerm]);
 
-  // Dynamic fee types based on the selected category's actual price columns
+  // Dynamic fee types based on selected Category
   const availableFeeTypes = useMemo(() => {
     if (selectedCategory === 'ALL') {
       return ['ALL', 'REGULAR', 'FLEXI', 'LUMPSUM (Absent)'] as (FeeType | 'ALL')[];
@@ -228,7 +228,7 @@ export const SearchByFilter: React.FC<SearchByFilterProps> = ({
       r.price !== null ? r.price.toFixed(2) : 'Not Available',
     ]);
 
-    const csvContent = [headers.join(','), ...rows.map((row) => row.join(','))].join('\\r\\n');
+    const csvContent = [headers.join(','), ...rows.map((row) => row.join(','))].join('\r\n');
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -410,54 +410,75 @@ export const SearchByFilter: React.FC<SearchByFilterProps> = ({
             <div className="flex items-center gap-2">
               <input
                 type="number"
+                min="0"
+                step="any"
                 value={minPrice}
                 onChange={(e) => setMinPrice(e.target.value)}
-                placeholder="Min"
-                className="w-full px-3 py-2.5 bg-[#F8FAFC] dark:bg-slate-900 border border-[#E2E8F0] dark:border-slate-700 rounded-lg text-[#0F172A] dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 focus:bg-white dark:focus:bg-slate-800 focus:outline-hidden focus:ring-2 focus:ring-[#006B45]"
+                placeholder="Min AED"
+                className="w-1/2 px-3 py-2.5 bg-[#F8FAFC] dark:bg-slate-900 border border-[#E2E8F0] dark:border-slate-700 rounded-lg text-[#0F172A] dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 text-xs font-mono focus:bg-white dark:focus:bg-slate-800 focus:outline-hidden focus:ring-2 focus:ring-[#006B45]"
               />
+              <span className="text-[#64748B] dark:text-slate-400 text-xs font-medium">—</span>
               <input
                 type="number"
+                min="0"
+                step="any"
                 value={maxPrice}
                 onChange={(e) => setMaxPrice(e.target.value)}
-                placeholder="Max"
-                className="w-full px-3 py-2.5 bg-[#F8FAFC] dark:bg-slate-900 border border-[#E2E8F0] dark:border-slate-700 rounded-lg text-[#0F172A] dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 focus:bg-white dark:focus:bg-slate-800 focus:outline-hidden focus:ring-2 focus:ring-[#006B45]"
+                placeholder="Max AED"
+                className="w-1/2 px-3 py-2.5 bg-[#F8FAFC] dark:bg-slate-900 border border-[#E2E8F0] dark:border-slate-700 rounded-lg text-[#0F172A] dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 text-xs font-mono focus:bg-white dark:focus:bg-slate-800 focus:outline-hidden focus:ring-2 focus:ring-[#006B45]"
               />
             </div>
           </div>
         </div>
 
-        {/* 3. Bottom Actions & Active Filters Summary */}
-        <div className="flex flex-wrap items-center justify-between gap-3 mt-5 pt-4 border-t border-[#E2E8F0] dark:border-slate-800">
-          <div className="flex items-center gap-2">
-            <button
-              onClick={handleApplyFilters}
-              className="flex items-center gap-1.5 px-4 py-2 bg-[#006B45] text-white rounded-lg text-xs font-semibold hover:bg-[#064E3B] transition-colors shadow-xs"
-            >
-              <Filter className="w-3.5 h-3.5" />
-              <span>Apply Filters</span>
-            </button>
-            <button
-              onClick={handleResetFilters}
-              className="flex items-center gap-1.5 px-4 py-2 bg-white dark:bg-slate-800 text-[#64748B] dark:text-slate-300 border border-[#E2E8F0] dark:border-slate-700 rounded-lg text-xs font-semibold hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-              <span>Reset All Filters</span>
-            </button>
-          </div>
-          {hasActiveFilters && (
-            <span className="text-xs text-[#64748B] dark:text-slate-400">
-              Active filters applied
-            </span>
-          )}
+        {/* 3. Action Buttons: Search Prices + Reset Filters */}
+        <div className="flex items-center justify-end gap-3 mt-4 pt-3 border-t border-[#E2E8F0] dark:border-slate-800">
+          <button
+            onClick={handleResetFilters}
+            className="flex items-center gap-1.5 px-4 py-2.5 text-xs font-semibold text-[#64748B] dark:text-slate-300 hover:text-[#0F172A] dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors border border-[#E2E8F0] dark:border-slate-700"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            <span>Reset Filters</span>
+          </button>
+
+          <button
+            onClick={handleApplyFilters}
+            className="flex items-center gap-2 px-6 py-2.5 bg-[#006B45] hover:bg-[#064E3B] text-white font-bold text-xs rounded-lg transition-colors shadow-xs"
+          >
+            <Search className="w-3.5 h-3.5 text-emerald-200" />
+            <span>Search Prices</span>
+          </button>
         </div>
       </div>
 
-      {/* 4. Results Table */}
+      {/* 4. Results Header & Count */}
+      <div className="flex items-center justify-between text-xs sm:text-sm text-[#64748B] dark:text-slate-400 px-1">
+        <div className="flex items-center gap-2">
+          <span>
+            Found <strong className="text-[#0F172A] dark:text-slate-100 font-bold text-base sm:text-lg tabular-nums">{filteredResults.length}</strong> matching price combination{filteredResults.length === 1 ? '' : 's'}
+          </span>
+          {hasActiveFilters && (
+            <span className="text-[11px] text-[#006B45] dark:text-emerald-300 bg-[#F0FDF4] dark:bg-emerald-950/60 px-2 py-0.5 rounded border border-[#D1FAE5] dark:border-emerald-800/70 font-semibold">
+              Filtered
+            </span>
+          )}
+        </div>
+
+        <span className="text-xs text-[#059669] dark:text-emerald-400 font-medium hidden sm:inline">
+          Click column headers to sort results
+        </span>
+      </div>
+
+      {/* 5. Results Table */}
       {filteredResults.length === 0 ? (
-        <div className="bg-white dark:bg-[#0F172A] border border-[#E2E8F0] dark:border-slate-800 rounded-xl p-10 text-center shadow-2xs">
-          <Search className="w-8 h-8 text-slate-300 mx-auto mb-3" />
-          <h3 className="text-sm font-bold text-[#0F172A] dark:text-slate-100">No Results Found</h3>
-          <p className="text-xs text-[#64748B] dark:text-slate-400 mt-1">Try adjusting your filters to find matching services.</p>
+        <div className="bg-white dark:bg-[#0F172A] border border-[#E2E8F0] dark:border-slate-800 rounded-xl p-12 text-center">
+          <div className="w-12 h-12 rounded-full bg-[#F0FDF4] dark:bg-emerald-950/60 text-[#006B45] dark:text-emerald-400 flex items-center justify-center mx-auto mb-3">
+            <Filter className="w-6 h-6" />
+          </div>
+          <h4 className="text-base font-bold text-[#0F172A] dark:text-slate-100">No results found</h4>
+          <p className="text-xs text-[#64748B] dark:text-slate-400 mt-1 max-w-sm mx-auto">
+            No prices match your selected criteria. Try adjusting the category, fee type, or price range.
+          </p>
           <button
             onClick={handleResetFilters}
             className="mt-4 inline-flex items-center gap-1.5 px-4 py-2 bg-[#006B45] text-white rounded-lg text-xs font-semibold hover:bg-[#064E3B] transition-colors shadow-xs"
@@ -472,6 +493,7 @@ export const SearchByFilter: React.FC<SearchByFilterProps> = ({
             <table className="w-full text-left border-collapse text-xs sm:text-sm">
               <thead>
                 <tr className="bg-[#F8FAFC] dark:bg-slate-900 border-b border-[#E2E8F0] dark:border-slate-800 text-[#64748B] dark:text-slate-300 font-semibold uppercase tracking-wider text-[11px]">
+                  {/* Service Name Header */}
                   <th
                     onClick={() => handleSort('service')}
                     className="py-3 px-4 cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors select-none"
@@ -481,6 +503,8 @@ export const SearchByFilter: React.FC<SearchByFilterProps> = ({
                       <ArrowUpDown className="w-3.5 h-3.5 text-[#006B45] dark:text-emerald-400" />
                     </div>
                   </th>
+
+                  {/* Category Header */}
                   <th
                     onClick={() => handleSort('category')}
                     className="py-3 px-3 cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors select-none"
@@ -490,6 +514,8 @@ export const SearchByFilter: React.FC<SearchByFilterProps> = ({
                       <ArrowUpDown className="w-3.5 h-3.5 text-[#006B45] dark:text-emerald-400" />
                     </div>
                   </th>
+
+                  {/* Fee Type Header */}
                   <th
                     onClick={() => handleSort('feeType')}
                     className="py-3 px-3 cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors select-none"
@@ -499,6 +525,8 @@ export const SearchByFilter: React.FC<SearchByFilterProps> = ({
                       <ArrowUpDown className="w-3.5 h-3.5 text-[#006B45] dark:text-emerald-400" />
                     </div>
                   </th>
+
+                  {/* Price (AED) Header */}
                   <th
                     onClick={() => handleSort('price')}
                     className="py-3 px-4 text-right cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors select-none"
@@ -508,9 +536,12 @@ export const SearchByFilter: React.FC<SearchByFilterProps> = ({
                       <ArrowUpDown className="w-3.5 h-3.5 text-[#006B45] dark:text-emerald-400" />
                     </div>
                   </th>
+
+                  {/* Actions Header */}
                   <th className="py-3 px-3 text-center w-28">Actions</th>
                 </tr>
               </thead>
+
               <tbody className="divide-y divide-[#E2E8F0] dark:divide-slate-800">
                 {filteredResults.map((record) => {
                   const isAvailable = record.price !== null;
@@ -522,17 +553,24 @@ export const SearchByFilter: React.FC<SearchByFilterProps> = ({
                       key={record.id}
                       className="hover:bg-[#F0FDF4]/50 dark:hover:bg-emerald-950/30 transition-colors"
                     >
+                      {/* Service Name */}
                       <td className="py-3 px-4 font-semibold text-[#0F172A] dark:text-slate-100">
                         {record.serviceName}
                       </td>
+
+                      {/* Category */}
                       <td className="py-3 px-3">
                         <span className="font-bold text-[#006B45] dark:text-emerald-300 bg-[#F0FDF4] dark:bg-emerald-950/60 border border-[#D1FAE5] dark:border-emerald-800/70 px-2.5 py-0.5 rounded-md text-xs">
                           {record.category}
                         </span>
                       </td>
+
+                      {/* Fee Type */}
                       <td className="py-3 px-3 text-[#64748B] dark:text-slate-400 text-xs">
                         {record.feeType}
                       </td>
+
+                      {/* Price (AED) */}
                       <td className="py-3 px-4 text-right">
                         {isAvailable ? (
                           <span className="text-base font-bold text-[#0F172A] dark:text-slate-100 tabular-nums font-mono">
@@ -544,8 +582,11 @@ export const SearchByFilter: React.FC<SearchByFilterProps> = ({
                           </span>
                         )}
                       </td>
+
+                      {/* Quick Actions (Copy Price & Copy Summary) */}
                       <td className="py-3 px-3 text-center">
                         <div className="flex items-center justify-center gap-1.5">
+                          {/* Copy Price Button */}
                           <button
                             onClick={(e) => handleCopyPrice(e, record)}
                             disabled={!isAvailable}
@@ -562,6 +603,8 @@ export const SearchByFilter: React.FC<SearchByFilterProps> = ({
                               <Copy className="w-3.5 h-3.5" />
                             )}
                           </button>
+
+                          {/* Copy Summary Button */}
                           <button
                             onClick={(e) => handleCopySummary(e, record)}
                             title="Copy full summary"
