@@ -13,7 +13,7 @@
     {
       "binding": "DB",
       "database_name": "ecodrive-db",
-      "database_id": "REPLACE_WITH_YOUR_CLOUDFLARE_D1_DATABASE_ID",
+      "database_id": "1d62860c-443f-4e4f-b147-9c2350d3cb84",
       "migrations_dir": "migrations"
     }
   ]
