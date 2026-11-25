@@ -10,30 +10,85 @@ interface CachedPin {
 }
 
 const PIN_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const resolvedPinCache = new Map<string, CachedPin | null>();
+const PIN_RETRY_AFTER_MS = 30 * 1000;
+const resolvedPinCache = new Map<string, CachedPin>();
+const failedPinCache = new Map<string, number>();
 let lastBulkResolveAt = 0;
 
-function extractCoordsFromGoogleMapsUrl(urlStr: string): { lat: number; lng: number } | null {
+function isValidUaeCoords(lat: number, lng: number): boolean {
+  return (
+    Number.isFinite(lat) &&
+    Number.isFinite(lng) &&
+    lat >= 22.5 &&
+    lat <= 26.5 &&
+    lng >= 51.0 &&
+    lng <= 56.5
+  );
+}
+
+function tryMatchCoordsInText(text: string): { lat: number; lng: number } | null {
   // 1. Prefer exact pin coordinates (!3dLAT!4dLNG)
-  const m3d4d = urlStr.match(/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/);
+  const m3d4d = text.match(/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/);
   if (m3d4d) {
-    return { lat: parseFloat(m3d4d[1]), lng: parseFloat(m3d4d[2]) };
+    const lat = parseFloat(m3d4d[1]);
+    const lng = parseFloat(m3d4d[2]);
+    if (isValidUaeCoords(lat, lng)) return { lat, lng };
   }
-  // 2. Search path (/maps/search/LAT,+LNG or /maps/search/LAT,LNG)
-  const mSearch = urlStr.match(/\/search\/(-?\d+\.\d+),[\s+]*(-?\d+\.\d+)/);
+  // 2. Search path (/maps/search/LAT,+LNG or /maps/search/LAT,LNG or %2C / %2B)
+  const mSearch = text.match(/\/search\/(-?\d+\.\d+)(?:,|%2C)[\s+%2B]*(-?\d+\.\d+)/i);
   if (mSearch) {
-    return { lat: parseFloat(mSearch[1]), lng: parseFloat(mSearch[2]) };
+    const lat = parseFloat(mSearch[1]);
+    const lng = parseFloat(mSearch[2]);
+    if (isValidUaeCoords(lat, lng)) return { lat, lng };
   }
   // 3. Query param (?q=LAT,LNG or ?query=LAT,LNG)
-  const mQuery = urlStr.match(/[?&](?:q|query|ll)=(-?\d+\.\d+)(?:,|%2C)\s*(-?\d+\.\d+)/);
+  const mQuery = text.match(/[?&](?:q|query|ll)=(-?\d+\.\d+)(?:,|%2C)[\s+%2B]*(-?\d+\.\d+)/i);
   if (mQuery) {
-    return { lat: parseFloat(mQuery[1]), lng: parseFloat(mQuery[2]) };
+    const lat = parseFloat(mQuery[1]);
+    const lng = parseFloat(mQuery[2]);
+    if (isValidUaeCoords(lat, lng)) return { lat, lng };
   }
   // 4. Viewport center fallback (@LAT,LNG)
-  const mAt = urlStr.match(/@(-?\d+\.\d+),(-?\d+\.\d+)/);
+  const mAt = text.match(/@(-?\d+\.\d+)(?:,|%2C)(-?\d+\.\d+)/i);
   if (mAt) {
-    return { lat: parseFloat(mAt[1]), lng: parseFloat(mAt[2]) };
+    const lat = parseFloat(mAt[1]);
+    const lng = parseFloat(mAt[2]);
+    if (isValidUaeCoords(lat, lng)) return { lat, lng };
   }
+  return null;
+}
+
+function extractCoordsFromGoogleMapsUrl(urlStr: string): { lat: number; lng: number } | null {
+  const direct = tryMatchCoordsInText(urlStr);
+  if (direct) return direct;
+
+  try {
+    const parsed = new URL(urlStr);
+    const continueParam = parsed.searchParams.get('continue');
+    if (continueParam) {
+      const fromContinue = tryMatchCoordsInText(continueParam);
+      if (fromContinue) return fromContinue;
+      try {
+        const decodedContinue = decodeURIComponent(continueParam);
+        const fromDecodedContinue = tryMatchCoordsInText(decodedContinue);
+        if (fromDecodedContinue) return fromDecodedContinue;
+      } catch {
+        // ignore malformed URI sequence
+      }
+    }
+  } catch {
+    // ignore URL parse error
+  }
+
+  try {
+    const decoded = decodeURIComponent(urlStr);
+    if (decoded !== urlStr) {
+      return tryMatchCoordsInText(decoded);
+    }
+  } catch {
+    // ignore malformed URI sequence
+  }
+
   return null;
 }
 
@@ -53,35 +108,76 @@ async function resolveSinglePinUrl(pinUrl: string): Promise<CachedPin | null> {
   if (!isAllowedMapsShortUrl(pinUrl)) return null;
 
   const existing = resolvedPinCache.get(pinUrl);
-  if (existing !== undefined) {
-    if (existing === null) return null;
-    if (Date.now() - existing.cachedAt < PIN_CACHE_TTL_MS) {
-      return existing;
-    }
+  if (existing && Date.now() - existing.cachedAt < PIN_CACHE_TTL_MS) {
+    return existing;
+  }
+
+  const lastFailedAt = failedPinCache.get(pinUrl);
+  if (lastFailedAt && Date.now() - lastFailedAt < PIN_RETRY_AFTER_MS) {
+    return null;
   }
 
   try {
-    const response = await fetch(pinUrl, {
-      redirect: 'follow',
-      signal: AbortSignal.timeout(8000),
-    });
-    const finalUrl = response.url;
-    const coords = extractCoordsFromGoogleMapsUrl(finalUrl);
-    if (!coords) {
-      resolvedPinCache.set(pinUrl, null);
-      return null;
+    let currentUrl = pinUrl;
+    for (let hop = 0; hop < 6; hop++) {
+      const response = await fetch(currentUrl, {
+        redirect: 'manual',
+        signal: AbortSignal.timeout(6000),
+      });
+
+      const locationHeader = response.headers.get('location');
+      try {
+        await response.body?.cancel();
+      } catch {
+        // ignore body cancel error
+      }
+
+      if (locationHeader) {
+        const nextUrl = new URL(locationHeader, currentUrl).toString();
+        const coords = extractCoordsFromGoogleMapsUrl(nextUrl);
+        if (coords) {
+          const entry: CachedPin = {
+            lat: coords.lat,
+            lng: coords.lng,
+            resolvedUrl: nextUrl,
+            cachedAt: Date.now(),
+          };
+          resolvedPinCache.set(pinUrl, entry);
+          failedPinCache.delete(pinUrl);
+          return entry;
+        }
+        currentUrl = nextUrl;
+        continue;
+      }
+
+      const finalCoords = extractCoordsFromGoogleMapsUrl(response.url || currentUrl);
+      if (finalCoords) {
+        const entry: CachedPin = {
+          lat: finalCoords.lat,
+          lng: finalCoords.lng,
+          resolvedUrl: response.url || currentUrl,
+          cachedAt: Date.now(),
+        };
+        resolvedPinCache.set(pinUrl, entry);
+        failedPinCache.delete(pinUrl);
+        return entry;
+      }
+      break;
     }
-    const entry: CachedPin = {
-      lat: coords.lat,
-      lng: coords.lng,
-      resolvedUrl: finalUrl,
-      cachedAt: Date.now(),
-    };
-    resolvedPinCache.set(pinUrl, entry);
-    return entry;
+
+    failedPinCache.set(pinUrl, Date.now());
+    return null;
   } catch (err) {
     console.warn(`Failed to resolve Google Maps short link ${pinUrl}:`, err);
+    failedPinCache.set(pinUrl, Date.now());
     return null;
+  }
+}
+
+async function resolvePinBatch(urls: string[], concurrency = 5): Promise<void> {
+  for (let i = 0; i < urls.length; i += concurrency) {
+    const chunk = urls.slice(i, i + concurrency);
+    await Promise.all(chunk.map((u) => resolveSinglePinUrl(u)));
   }
 }
 
@@ -137,12 +233,17 @@ export async function resolveOfficialTransportPins(env: Env): Promise<{
   if (alQuozCenterUrl) allUrls.push(alQuozCenterUrl);
   if (dicReferenceBranchUrl) allUrls.push(dicReferenceBranchUrl);
 
-  const isCacheFresh =
-    Date.now() - lastBulkResolveAt < PIN_CACHE_TTL_MS &&
-    allUrls.every((u) => resolvedPinCache.has(u));
+  const now = Date.now();
+  const pendingUrls = allUrls.filter((u) => {
+    const cached = resolvedPinCache.get(u);
+    if (cached && now - cached.cachedAt < PIN_CACHE_TTL_MS) return false;
+    const failedAt = failedPinCache.get(u);
+    if (failedAt && now - failedAt < PIN_RETRY_AFTER_MS) return false;
+    return true;
+  });
 
-  if (!isCacheFresh) {
-    await Promise.all(allUrls.map((u) => resolveSinglePinUrl(u)));
+  if (pendingUrls.length > 0 || now - lastBulkResolveAt >= PIN_CACHE_TTL_MS) {
+    await resolvePinBatch(pendingUrls, 5);
     lastBulkResolveAt = Date.now();
   }
 

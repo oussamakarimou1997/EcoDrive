@@ -10,6 +10,15 @@ import {
   DEFAULT_BRANCH_INFO_RECORDS,
 } from '../src/data/branchInfoData';
 import {
+  DEFAULT_PRICES_COLUMNS,
+  DEFAULT_PRICES_CONTENT_HASH,
+  DEFAULT_PRICES_DETECTED_COLUMNS,
+  DEFAULT_PRICES_FILE_NAME,
+  DEFAULT_PRICES_NOTES,
+  DEFAULT_PRICES_RECORDS,
+  DEFAULT_PRICES_SHEET_NAMES,
+} from '../src/data/defaultPricesSeed';
+import {
   DetectedInstructorColumns,
   InstructorRecord,
   InstructorsDataset,
@@ -20,6 +29,13 @@ import {
   DetectedBranchInfoColumns,
   DynamicBranchFilterConfig,
 } from '../src/types/branchInfo';
+import {
+  DetectedPriceColumns,
+  PriceRecord,
+  PriceValidationStatus,
+  PricesBackupInfo,
+  PricesDataset,
+} from '../src/types/prices';
 import {
   generateRandomHexToken,
   hashAccessCodePbkdf2,
@@ -210,6 +226,7 @@ function buildBranchFilterConfigsServer(
 const SEED_BATCH_SIZE = 40;
 let instructorsSeedPromise: Promise<void> | null = null;
 let branchInfoSeedPromise: Promise<void> | null = null;
+let pricesSeedPromise: Promise<void> | null = null;
 
 async function executeChunkedBatch(
   db: D1Database,
@@ -1163,4 +1180,823 @@ export async function changeAdminAccessCode(
   ]);
 
   return createAdminSession(db);
+}
+
+// ---------------------------------------------------------------------------
+// Prices Catalog CRUD, Excel Import Backup & Rollback (Cloudflare D1)
+// ---------------------------------------------------------------------------
+const DEFAULT_MANUAL_PRICE_COLUMNS = [
+  'Category',
+  'Product / Service',
+  'Price',
+  'Currency',
+  'Branch',
+  'Notes',
+];
+
+function detectPriceColumnsServer(columns: string[]): DetectedPriceColumns {
+  const findCol = (patterns: RegExp[]): string | null => {
+    for (const pattern of patterns) {
+      const match = columns.find((col) => pattern.test(col.trim()));
+      if (match) return match;
+    }
+    return null;
+  };
+
+  const findAllCols = (patterns: RegExp[]): string[] => {
+    const matched: string[] = [];
+    for (const col of columns) {
+      if (patterns.some((p) => p.test(col.trim()))) {
+        matched.push(col);
+      }
+    }
+    return matched;
+  };
+
+  const categoryCol = findCol([
+    /^(category|license\s*category|licence\s*category|vehicle\s*category|course\s*category|group|department|section|type)$/i,
+    /\b(category|vehicle\s*type|license\s*type)\b/i,
+  ]);
+  const productCol = findCol([
+    /^(product(\s*name)?|offer(\s*name)?|service(\s*name)?|package(\s*name)?|course(\s*name)?|item(\s*name)?|title|name|description|particulars)$/i,
+    /\b(service|product|offer|package|course|item)\b/i,
+  ]);
+  const subCategoryCol = findCol([
+    /^(sub\s*category|subcategory|variant|tier|shift|plan|class|option)$/i,
+    /\b(sub\s*category|variant|tier|shift|plan)\b/i,
+  ]);
+  const feeTypeCol = findCol([
+    /^(fee\s*type|payment\s*type|schedule\s*type|mode|training\s*type)$/i,
+    /\b(fee\s*type|payment|schedule|training)\b/i,
+  ]);
+  const currencyCol = findCol([/^(currency|curr|unit)$/i, /\bcurrency\b/i]);
+  const priceCol = findCol([
+    /^(price|total\s*price|fee|amount|rate|cost|tariff|total(\s*amount)?|selling\s*price|gross\s*price|price\s*\(aed\)|aed(\s*price)?)$/i,
+    /\b(price|fee|amount|rate|cost|tariff|aed)\b/i,
+  ]);
+  const semanticNonPriceCols = new Set(
+    [categoryCol, productCol, subCategoryCol, feeTypeCol, currencyCol].filter(
+      (v): v is string => Boolean(v)
+    )
+  );
+  const priceCols = findAllCols([
+    /^(price|total\s*price|fee|amount|rate|cost|tariff|total(\s*amount)?|selling\s*price|gross\s*price|regular|flexi|lumpsum|vip|standard|with\s*vat|without\s*vat|vat|discount)/i,
+    /\b(price|fee|amount|rate|cost|tariff|aed|regular|flexi|lumpsum)\b/i,
+  ]).filter((col) => !semanticNonPriceCols.has(col));
+  const branchCol = findCol([
+    /^(branch|branch\s*name|center|centre|location|emirate)$/i,
+    /\b(branch|center|centre)\b/i,
+  ]);
+  const durationCol = findCol([
+    /^(duration|hours|classes|sessions|lessons|validity)$/i,
+    /\b(hours|classes|sessions|lessons|duration)\b/i,
+  ]);
+  const codeCol = findCol([
+    /^(code|sku|item\s*code|service\s*code|id|s\.?\s*no\.?|sr\.?\s*no\.?|#)$/i,
+  ]);
+  const notesCol = findCol([
+    /^(notes?|remarks?|comments?|details|info|conditions?)$/i,
+    /\b(note|remark|comment|condition)\b/i,
+  ]);
+
+  return {
+    categoryCol,
+    productCol,
+    subCategoryCol,
+    feeTypeCol,
+    priceCol: priceCol || priceCols[0] || null,
+    priceCols,
+    currencyCol,
+    branchCol,
+    durationCol,
+    codeCol,
+    notesCol,
+  };
+}
+
+function parsePriceValueServer(
+  rawDisplay: string,
+  explicitCurrency = ''
+): {
+  priceDisplay: string;
+  priceNumeric: number | null;
+  currency: string;
+  priceStatus: PriceValidationStatus;
+} {
+  const trimmed = rawDisplay.trim();
+  const upper = trimmed.toUpperCase();
+
+  let detectedCurrency = explicitCurrency.trim().toUpperCase();
+  if (!detectedCurrency) {
+    if (upper.includes('AED') || upper.includes('DHS') || upper.includes('د.إ')) {
+      detectedCurrency = 'AED';
+    } else if (upper.includes('USD') || trimmed.includes('$')) {
+      detectedCurrency = 'USD';
+    } else if (upper.includes('EUR') || trimmed.includes('€')) {
+      detectedCurrency = 'EUR';
+    } else if (upper.includes('GBP') || trimmed.includes('£')) {
+      detectedCurrency = 'GBP';
+    } else {
+      detectedCurrency = 'AED';
+    }
+  }
+
+  if (
+    !trimmed ||
+    trimmed === '-' ||
+    trimmed === '—' ||
+    upper === 'N/A' ||
+    upper === 'NA' ||
+    upper === 'NULL' ||
+    upper === 'TBD' ||
+    upper === 'NOT AVAILABLE'
+  ) {
+    return {
+      priceDisplay: trimmed,
+      priceNumeric: null,
+      currency: detectedCurrency,
+      priceStatus: 'missing',
+    };
+  }
+
+  if (upper === 'FREE' || upper === 'COMPLIMENTARY') {
+    return {
+      priceDisplay: trimmed,
+      priceNumeric: 0,
+      currency: detectedCurrency,
+      priceStatus: 'valid',
+    };
+  }
+
+  const sanitized = trimmed.replace(/AED|DHS|USD|EUR|GBP|د\.إ|[$€£,\s]/gi, '').trim();
+  if (/^-?\d+(\.\d+)?$/.test(sanitized)) {
+    const num = Number(sanitized);
+    if (Number.isFinite(num)) {
+      return {
+        priceDisplay: trimmed,
+        priceNumeric: num,
+        currency: detectedCurrency,
+        priceStatus: 'valid',
+      };
+    }
+  }
+
+  const embeddedMatch = trimmed.replace(/,/g, '').match(/-?\d+(\.\d+)?/);
+  if (
+    embeddedMatch &&
+    !/[a-zA-Z]{4,}/.test(trimmed.replace(/AED|DHS|USD|EUR|GBP|VAT|INCL|EXCL/gi, ''))
+  ) {
+    const num = Number(embeddedMatch[0]);
+    if (Number.isFinite(num)) {
+      return {
+        priceDisplay: trimmed,
+        priceNumeric: num,
+        currency: detectedCurrency,
+        priceStatus: 'valid',
+      };
+    }
+  }
+
+  return {
+    priceDisplay: trimmed,
+    priceNumeric: null,
+    currency: detectedCurrency,
+    priceStatus: 'invalid_format',
+  };
+}
+
+async function getLatestPricesBackupInfo(db: D1Database): Promise<PricesBackupInfo> {
+  try {
+    const backup = await db
+      .prepare(
+        `SELECT id, created_at, file_name, record_count, reason
+         FROM prices_backups
+         ORDER BY id DESC
+         LIMIT 1`
+      )
+      .first<{
+        id: number;
+        created_at: string;
+        file_name: string;
+        record_count: number;
+        reason: string;
+      }>();
+
+    if (!backup) {
+      return { hasBackup: false };
+    }
+
+    return {
+      hasBackup: true,
+      latestBackupId: backup.id,
+      createdAt: backup.created_at,
+      fileName: backup.file_name,
+      recordCount: backup.record_count,
+      reason: backup.reason,
+    };
+  } catch {
+    return { hasBackup: false };
+  }
+}
+
+export async function ensurePricesSeeded(db: D1Database): Promise<void> {
+  if (pricesSeedPromise) {
+    return pricesSeedPromise;
+  }
+
+  pricesSeedPromise = (async () => {
+    const existingMeta = await db
+      .prepare('SELECT id FROM prices_meta WHERE id = ?')
+      .bind('active')
+      .first<{ id: string }>();
+
+    if (existingMeta) return;
+
+    const existingCount = await db
+      .prepare('SELECT COUNT(*) AS cnt FROM prices')
+      .first<{ cnt: number }>();
+
+    const now = new Date().toISOString();
+
+    await db
+      .prepare(
+        `INSERT OR IGNORE INTO prices_meta
+         (id, file_name, sheet_names_json, columns_json, detected_columns_json, notes_json, content_hash, imported_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        'active',
+        DEFAULT_PRICES_FILE_NAME,
+        JSON.stringify(DEFAULT_PRICES_SHEET_NAMES),
+        JSON.stringify(DEFAULT_PRICES_COLUMNS),
+        JSON.stringify(DEFAULT_PRICES_DETECTED_COLUMNS),
+        JSON.stringify(DEFAULT_PRICES_NOTES),
+        DEFAULT_PRICES_CONTENT_HASH,
+        'Database Synced (Official CSV Tariff)'
+      )
+      .run();
+
+    if ((existingCount?.cnt ?? 0) > 0) {
+      return;
+    }
+
+    const insertStmt = db.prepare(
+      `INSERT OR IGNORE INTO prices
+       (row_key, sheet_name, sort_order, category, product_name, price_display, price_numeric, currency, price_status, fields_json, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+
+    const stmts = DEFAULT_PRICES_RECORDS.map((rec, index) =>
+      insertStmt.bind(
+        rec._rowKey,
+        rec._sheetName || 'Sheet1',
+        index + 1,
+        rec.category,
+        rec.productName,
+        rec.priceDisplay,
+        rec.priceNumeric,
+        rec.currency || 'AED',
+        rec.priceStatus || 'valid',
+        JSON.stringify(rec.fields),
+        now,
+        now
+      )
+    );
+
+    await executeChunkedBatch(db, stmts);
+  })().finally(() => {
+    pricesSeedPromise = null;
+  });
+
+  return pricesSeedPromise;
+}
+
+export async function getPricesDatasetFromDb(db: D1Database): Promise<PricesDataset> {
+  await ensurePricesSeeded(db);
+  const backupInfo = await getLatestPricesBackupInfo(db);
+
+  const metaRow = await db
+    .prepare('SELECT * FROM prices_meta WHERE id = ?')
+    .bind('active')
+    .first<{
+      file_name: string;
+      sheet_names_json: string;
+      columns_json: string;
+      detected_columns_json: string;
+      notes_json: string;
+      content_hash: string;
+      imported_at: string;
+    }>();
+
+  if (!metaRow) {
+    return {
+      fileName: 'No Excel Price List Imported Yet',
+      sheetNames: [],
+      columns: [],
+      detectedColumns: detectPriceColumnsServer([]),
+      records: [],
+      notes: [],
+      contentHash: '',
+      importedAt: '',
+      backupInfo,
+    };
+  }
+
+  const rowsResult = await db
+    .prepare(
+      `SELECT row_key, sheet_name, category, product_name, price_display, price_numeric, currency, price_status, fields_json
+       FROM prices
+       ORDER BY sort_order ASC`
+    )
+    .all<{
+      row_key: string;
+      sheet_name: string;
+      category: string;
+      product_name: string;
+      price_display: string;
+      price_numeric: number | null;
+      currency: string;
+      price_status: string;
+      fields_json: string;
+    }>();
+
+  const rows = rowsResult.results || [];
+  const records: PriceRecord[] = rows.map((r) => ({
+    _rowKey: r.row_key,
+    _sheetName: r.sheet_name,
+    category: r.category,
+    productName: r.product_name,
+    priceDisplay: r.price_display,
+    priceNumeric: r.price_numeric,
+    currency: r.currency || 'AED',
+    priceStatus:
+      r.price_status === 'missing' || r.price_status === 'invalid_format'
+        ? r.price_status
+        : 'valid',
+    fields: JSON.parse(r.fields_json) as Record<string, string>,
+  }));
+
+  return {
+    fileName: metaRow.file_name,
+    sheetNames: JSON.parse(metaRow.sheet_names_json) as string[],
+    columns: JSON.parse(metaRow.columns_json) as string[],
+    detectedColumns: JSON.parse(metaRow.detected_columns_json) as DetectedPriceColumns,
+    records,
+    notes: JSON.parse(metaRow.notes_json) as string[],
+    contentHash: metaRow.content_hash || '',
+    importedAt: metaRow.imported_at,
+    backupInfo,
+  };
+}
+
+export async function replacePricesDatasetInDb(
+  db: D1Database,
+  payload: {
+    fileName: string;
+    sheetNames: string[];
+    columns: string[];
+    detectedColumns: DetectedPriceColumns;
+    records: PriceRecord[];
+    notes: string[];
+    contentHash: string;
+    importedAt: string;
+  }
+): Promise<PricesDataset> {
+  if (!payload?.columns?.length || !payload?.records?.length) {
+    throw new ValidationError('Imported Excel dataset must include columns and at least one record.');
+  }
+  if (payload.records.length > 10000) {
+    throw new ValidationError('Imported Excel dataset exceeds maximum limit of 10,000 rows.');
+  }
+
+  const existingDataset = await getPricesDatasetFromDb(db);
+  const now = new Date().toISOString();
+
+  // Preserve rollback snapshot before overwriting existing D1 prices records
+  const isIdenticalReimport =
+    Boolean(existingDataset.contentHash) &&
+    Boolean(payload.contentHash) &&
+    existingDataset.contentHash === payload.contentHash &&
+    existingDataset.records.length === payload.records.length;
+
+  if (existingDataset.records.length > 0 && !isIdenticalReimport) {
+    const snapshot = JSON.stringify({
+      fileName: existingDataset.fileName,
+      sheetNames: existingDataset.sheetNames,
+      columns: existingDataset.columns,
+      detectedColumns: existingDataset.detectedColumns,
+      records: existingDataset.records,
+      notes: existingDataset.notes,
+      contentHash: existingDataset.contentHash,
+      importedAt: existingDataset.importedAt,
+    });
+
+    await db
+      .prepare(
+        `INSERT INTO prices_backups (created_at, reason, file_name, record_count, content_hash, snapshot_json)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        now,
+        `Before importing ${payload.fileName}`,
+        existingDataset.fileName,
+        existingDataset.records.length,
+        existingDataset.contentHash || '',
+        snapshot
+      )
+      .run();
+
+    await db
+      .prepare(
+        `DELETE FROM prices_backups
+         WHERE id NOT IN (
+           SELECT id FROM prices_backups ORDER BY id DESC LIMIT 5
+         )`
+      )
+      .run();
+  }
+
+  const normalizedCols = payload.columns.map((c) => String(c).trim()).filter(Boolean);
+  const seenKeys = new Set<string>();
+
+  const normalizedRecords: PriceRecord[] = payload.records.map((rec, idx) => {
+    const cleanFields: Record<string, string> = {};
+    for (const col of normalizedCols) {
+      const val = rec.fields?.[col];
+      cleanFields[col] = typeof val === 'string' ? val.trim() : val != null ? String(val).trim() : '';
+    }
+
+    let rawRowKey = (rec._rowKey || `prc-${idx + 1}`).trim();
+    if (!rawRowKey || seenKeys.has(rawRowKey)) {
+      rawRowKey = `prc-${idx + 1}-${generateRandomHexToken(2)}`;
+    }
+    seenKeys.add(rawRowKey);
+
+    const parsed = parsePriceValueServer(
+      String(rec.priceDisplay ?? ''),
+      String(rec.currency ?? '')
+    );
+
+    return {
+      _rowKey: rawRowKey,
+      _sheetName: (rec._sheetName || 'Sheet1').trim() || 'Sheet1',
+      category: String(rec.category ?? '').trim() || (rec._sheetName || 'General'),
+      productName: String(rec.productName ?? '').trim() || `Item #${idx + 1}`,
+      priceDisplay: parsed.priceDisplay,
+      priceNumeric: parsed.priceNumeric,
+      currency: parsed.currency,
+      priceStatus: parsed.priceStatus,
+      fields: cleanFields,
+    };
+  });
+
+  await db
+    .prepare(
+      `INSERT OR REPLACE INTO prices_meta
+       (id, file_name, sheet_names_json, columns_json, detected_columns_json, notes_json, content_hash, imported_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      'active',
+      payload.fileName,
+      JSON.stringify(payload.sheetNames || ['Sheet1']),
+      JSON.stringify(normalizedCols),
+      JSON.stringify(payload.detectedColumns || detectPriceColumnsServer(normalizedCols)),
+      JSON.stringify(payload.notes || []),
+      payload.contentHash || '',
+      payload.importedAt || now
+    )
+    .run();
+
+  await db.prepare('DELETE FROM prices').run();
+
+  const insertStmt = db.prepare(
+    `INSERT INTO prices
+     (row_key, sheet_name, sort_order, category, product_name, price_display, price_numeric, currency, price_status, fields_json, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+
+  const stmts = normalizedRecords.map((rec, idx) =>
+    insertStmt.bind(
+      rec._rowKey,
+      rec._sheetName,
+      idx + 1,
+      rec.category,
+      rec.productName,
+      rec.priceDisplay,
+      rec.priceNumeric,
+      rec.currency,
+      rec.priceStatus,
+      JSON.stringify(rec.fields),
+      now,
+      now
+    )
+  );
+
+  await executeChunkedBatch(db, stmts);
+
+  return getPricesDatasetFromDb(db);
+}
+
+export async function rollbackPricesDatasetInDb(db: D1Database): Promise<PricesDataset> {
+  const backup = await db
+    .prepare(
+      `SELECT id, snapshot_json
+       FROM prices_backups
+       ORDER BY id DESC
+       LIMIT 1`
+    )
+    .first<{ id: number; snapshot_json: string }>();
+
+  if (!backup) {
+    throw new NotFoundError('No previous Prices backup is available to restore.');
+  }
+
+  const snapshot = JSON.parse(backup.snapshot_json) as {
+    fileName: string;
+    sheetNames: string[];
+    columns: string[];
+    detectedColumns: DetectedPriceColumns;
+    records: PriceRecord[];
+    notes: string[];
+    contentHash: string;
+    importedAt: string;
+  };
+
+  const now = new Date().toISOString();
+
+  await db
+    .prepare(
+      `INSERT OR REPLACE INTO prices_meta
+       (id, file_name, sheet_names_json, columns_json, detected_columns_json, notes_json, content_hash, imported_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      'active',
+      snapshot.fileName,
+      JSON.stringify(snapshot.sheetNames || ['Sheet1']),
+      JSON.stringify(snapshot.columns || DEFAULT_MANUAL_PRICE_COLUMNS),
+      JSON.stringify(snapshot.detectedColumns || detectPriceColumnsServer(snapshot.columns || [])),
+      JSON.stringify(snapshot.notes || []),
+      snapshot.contentHash || '',
+      snapshot.importedAt || now
+    )
+    .run();
+
+  await db.prepare('DELETE FROM prices').run();
+
+  const insertStmt = db.prepare(
+    `INSERT INTO prices
+     (row_key, sheet_name, sort_order, category, product_name, price_display, price_numeric, currency, price_status, fields_json, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+
+  const stmts = (snapshot.records || []).map((rec, idx) =>
+    insertStmt.bind(
+      rec._rowKey,
+      rec._sheetName || 'Sheet1',
+      idx + 1,
+      rec.category || '',
+      rec.productName || '',
+      rec.priceDisplay || '',
+      rec.priceNumeric ?? null,
+      rec.currency || 'AED',
+      rec.priceStatus || 'valid',
+      JSON.stringify(rec.fields || {}),
+      now,
+      now
+    )
+  );
+
+  await executeChunkedBatch(db, stmts);
+
+  await db.prepare('DELETE FROM prices_backups WHERE id = ?').bind(backup.id).run();
+
+  return getPricesDatasetFromDb(db);
+}
+
+export async function createPriceRecordInDb(
+  db: D1Database,
+  payload: {
+    fields?: Record<string, unknown>;
+    sheetName?: string;
+    category?: string;
+    productName?: string;
+    priceDisplay?: string;
+    currency?: string;
+  }
+): Promise<PriceRecord> {
+  const existingDataset = await getPricesDatasetFromDb(db);
+  const now = new Date().toISOString();
+
+  let columns = existingDataset.columns;
+  let detected = existingDataset.detectedColumns;
+
+  if (columns.length === 0) {
+    const incomingKeys = Object.keys(payload.fields || {}).filter((k) => k.trim() !== '');
+    columns = incomingKeys.length > 0 ? incomingKeys : DEFAULT_MANUAL_PRICE_COLUMNS;
+    detected = detectPriceColumnsServer(columns);
+
+    await db
+      .prepare(
+        `INSERT OR REPLACE INTO prices_meta
+         (id, file_name, sheet_names_json, columns_json, detected_columns_json, notes_json, content_hash, imported_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        'active',
+        'Manual Prices Catalog',
+        JSON.stringify(['Sheet1']),
+        JSON.stringify(columns),
+        JSON.stringify(detected),
+        JSON.stringify([]),
+        '',
+        now
+      )
+      .run();
+  }
+
+  const cleanFields = normalizeFields(payload.fields || {}, columns);
+  const category =
+    (payload.category || '').trim() ||
+    (detected.categoryCol ? cleanFields[detected.categoryCol] : '') ||
+    'General';
+  const productName =
+    (payload.productName || '').trim() ||
+    (detected.productCol ? cleanFields[detected.productCol] : '') ||
+    Object.values(cleanFields).find((v) => v.trim() !== '') ||
+    '';
+
+  if (!productName) {
+    const targetCol = detected.productCol || columns[0];
+    throw new ValidationError('Product or service name is required.', {
+      [targetCol]: 'Product or service name is required.',
+    });
+  }
+
+  const rawPrice =
+    payload.priceDisplay !== undefined
+      ? String(payload.priceDisplay)
+      : detected.priceCol
+      ? cleanFields[detected.priceCol]
+      : '';
+  const explicitCurrency =
+    (payload.currency || '').trim() ||
+    (detected.currencyCol ? cleanFields[detected.currencyCol] : '');
+
+  const parsedPrice = parsePriceValueServer(rawPrice, explicitCurrency);
+
+  if (detected.categoryCol && !cleanFields[detected.categoryCol]) {
+    cleanFields[detected.categoryCol] = category;
+  }
+  if (detected.productCol && !cleanFields[detected.productCol]) {
+    cleanFields[detected.productCol] = productName;
+  }
+  if (detected.priceCol && cleanFields[detected.priceCol] === '' && parsedPrice.priceDisplay) {
+    cleanFields[detected.priceCol] = parsedPrice.priceDisplay;
+  }
+  if (detected.currencyCol && !cleanFields[detected.currencyCol]) {
+    cleanFields[detected.currencyCol] = parsedPrice.currency;
+  }
+
+  const maxOrderRow = await db
+    .prepare('SELECT COALESCE(MAX(sort_order), 0) AS max_order FROM prices')
+    .first<{ max_order: number }>();
+  const nextOrder = (maxOrderRow?.max_order || 0) + 1;
+
+  const rowKey = `prc-${Date.now()}-${generateRandomHexToken(4)}`;
+  const sheetName = (payload.sheetName || 'Sheet1').trim() || 'Sheet1';
+
+  await db
+    .prepare(
+      `INSERT INTO prices
+       (row_key, sheet_name, sort_order, category, product_name, price_display, price_numeric, currency, price_status, fields_json, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      rowKey,
+      sheetName,
+      nextOrder,
+      category,
+      productName,
+      parsedPrice.priceDisplay,
+      parsedPrice.priceNumeric,
+      parsedPrice.currency,
+      parsedPrice.priceStatus,
+      JSON.stringify(cleanFields),
+      now,
+      now
+    )
+    .run();
+
+  return {
+    _rowKey: rowKey,
+    _sheetName: sheetName,
+    category,
+    productName,
+    priceDisplay: parsedPrice.priceDisplay,
+    priceNumeric: parsedPrice.priceNumeric,
+    currency: parsedPrice.currency,
+    priceStatus: parsedPrice.priceStatus,
+    fields: cleanFields,
+  };
+}
+
+export async function updatePriceRecordInDb(
+  db: D1Database,
+  rowKey: string,
+  payload: {
+    fields?: Record<string, unknown>;
+    category?: string;
+    productName?: string;
+    priceDisplay?: string;
+    currency?: string;
+  }
+): Promise<PriceRecord> {
+  const existing = await db
+    .prepare('SELECT row_key, sheet_name FROM prices WHERE row_key = ?')
+    .bind(rowKey)
+    .first<{ row_key: string; sheet_name: string }>();
+
+  if (!existing) {
+    throw new NotFoundError('Price record was not found.');
+  }
+
+  const dataset = await getPricesDatasetFromDb(db);
+  const columns = dataset.columns.length > 0 ? dataset.columns : DEFAULT_MANUAL_PRICE_COLUMNS;
+  const detected = dataset.detectedColumns;
+  const cleanFields = normalizeFields(payload.fields || {}, columns);
+
+  const category =
+    (payload.category || '').trim() ||
+    (detected.categoryCol ? cleanFields[detected.categoryCol] : '') ||
+    'General';
+  const productName =
+    (payload.productName || '').trim() ||
+    (detected.productCol ? cleanFields[detected.productCol] : '') ||
+    Object.values(cleanFields).find((v) => v.trim() !== '') ||
+    '';
+
+  if (!productName) {
+    const targetCol = detected.productCol || columns[0];
+    throw new ValidationError('Product or service name is required.', {
+      [targetCol]: 'Product or service name is required.',
+    });
+  }
+
+  const rawPrice =
+    payload.priceDisplay !== undefined
+      ? String(payload.priceDisplay)
+      : detected.priceCol
+      ? cleanFields[detected.priceCol]
+      : '';
+  const explicitCurrency =
+    (payload.currency || '').trim() ||
+    (detected.currencyCol ? cleanFields[detected.currencyCol] : '');
+
+  const parsedPrice = parsePriceValueServer(rawPrice, explicitCurrency);
+
+  const now = new Date().toISOString();
+  await db
+    .prepare(
+      `UPDATE prices
+       SET category = ?, product_name = ?, price_display = ?, price_numeric = ?, currency = ?, price_status = ?, fields_json = ?, updated_at = ?
+       WHERE row_key = ?`
+    )
+    .bind(
+      category,
+      productName,
+      parsedPrice.priceDisplay,
+      parsedPrice.priceNumeric,
+      parsedPrice.currency,
+      parsedPrice.priceStatus,
+      JSON.stringify(cleanFields),
+      now,
+      rowKey
+    )
+    .run();
+
+  return {
+    _rowKey: rowKey,
+    _sheetName: existing.sheet_name,
+    category,
+    productName,
+    priceDisplay: parsedPrice.priceDisplay,
+    priceNumeric: parsedPrice.priceNumeric,
+    currency: parsedPrice.currency,
+    priceStatus: parsedPrice.priceStatus,
+    fields: cleanFields,
+  };
+}
+
+export async function deletePriceRecordInDb(db: D1Database, rowKey: string): Promise<void> {
+  await ensurePricesSeeded(db);
+  const result = await db
+    .prepare('DELETE FROM prices WHERE row_key = ?')
+    .bind(rowKey)
+    .run();
+
+  if (!result.meta || result.meta.changes === 0) {
+    throw new NotFoundError('Price record was not found.');
+  }
 }

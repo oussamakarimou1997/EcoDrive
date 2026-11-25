@@ -1,6 +1,6 @@
 import React from 'react';
 import {
-  SlidersHorizontal,
+  Tag,
   CheckCircle2,
   Bus,
   MapPin,
@@ -10,21 +10,27 @@ import {
   Sun,
   Moon,
 } from 'lucide-react';
-import { DataSourceState } from '../types/pricing';
 import { useTheme } from '../context/ThemeContext';
+import { PricesSummaryStats } from './PricesPage';
 
-export type ActiveTab = 'filter' | 'transport' | 'ai-transport-finder' | 'branches' | 'instructors' | 'branch-info';
+export type ActiveTab =
+  | 'prices'
+  | 'transport'
+  | 'ai-transport-finder'
+  | 'branches'
+  | 'instructors'
+  | 'branch-info';
 
 interface HeaderProps {
   activeTab: ActiveTab;
   setActiveTab: (tab: ActiveTab) => void;
-  dataSource: DataSourceState;
+  pricesStats: PricesSummaryStats;
 }
 
 export const Header: React.FC<HeaderProps> = ({
   activeTab,
   setActiveTab,
-  dataSource,
+  pricesStats,
 }) => {
   const { isDark, toggleTheme } = useTheme();
 
@@ -35,10 +41,10 @@ export const Header: React.FC<HeaderProps> = ({
           {/* Zone 1: Official Logo in brand container on mobile/tablet */}
           <div className="flex items-center gap-3 shrink-0 lg:hidden">
             <a
-              href="#filter"
+              href="#prices"
               onClick={(e) => {
                 e.preventDefault();
-                setActiveTab('filter');
+                setActiveTab('prices');
               }}
               className="flex items-center bg-[#064E3B] px-3 py-1.5 rounded-xl border border-emerald-400/20 shadow-2xs hover:opacity-95 transition-opacity"
               title="Eco Drive Driving institute"
@@ -49,7 +55,7 @@ export const Header: React.FC<HeaderProps> = ({
                 className="h-7 w-auto object-contain"
                 onError={(e) => {
                   (e.currentTarget as HTMLImageElement).src =
-                    "https://www.ecodrivedubai.com/wp-content/uploads/2026/01/eco-drive-logo_White-01-768x313.png";
+                    'https://www.ecodrivedubai.com/wp-content/uploads/2026/01/eco-drive-logo_White-01-768x313.png';
                 }}
               />
             </a>
@@ -60,7 +66,7 @@ export const Header: React.FC<HeaderProps> = ({
             <span className="font-semibold text-[#0F172A] dark:text-slate-100">Eco Drive</span>
             <span>/</span>
             <span className="text-[#006B45] dark:text-emerald-400 font-semibold">
-              {activeTab === 'filter' && 'Search by Filter'}
+              {activeTab === 'prices' && 'Prices'}
               {activeTab === 'transport' && 'Transportation'}
               {activeTab === 'ai-transport-finder' && 'AI Smart Transportation Finder'}
               {activeTab === 'branches' && 'Branch and Location'}
@@ -72,15 +78,15 @@ export const Header: React.FC<HeaderProps> = ({
           {/* Zone 2: Navigation links on tablet / medium screens */}
           <nav className="hidden sm:flex lg:hidden items-center gap-1 text-sm font-medium overflow-x-auto">
             <button
-              onClick={() => setActiveTab('filter')}
+              onClick={() => setActiveTab('prices')}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap shrink-0 text-xs font-semibold ${
-                activeTab === 'filter'
+                activeTab === 'prices'
                   ? 'bg-[#F0FDF4] dark:bg-emerald-950/70 text-[#006B45] dark:text-emerald-300 border border-[#D1FAE5] dark:border-emerald-800/70'
                   : 'text-[#64748B] dark:text-slate-300 hover:text-[#0F172A] dark:hover:text-white hover:bg-slate-50 dark:hover:bg-slate-800'
               }`}
             >
-              <SlidersHorizontal className="w-3.5 h-3.5" />
-              <span>Filter</span>
+              <Tag className="w-3.5 h-3.5" />
+              <span>Prices</span>
             </button>
 
             <button
@@ -169,8 +175,12 @@ export const Header: React.FC<HeaderProps> = ({
 
             <div className="flex items-center gap-2 bg-[#F0FDF4] dark:bg-emerald-950/60 border border-[#D1FAE5] dark:border-emerald-800/70 text-[#064E3B] dark:text-emerald-200 px-3 py-1.5 rounded-lg text-xs font-medium">
               <CheckCircle2 className="w-3.5 h-3.5 text-[#059669] dark:text-emerald-400 shrink-0" />
-              <span className="hidden sm:inline">Eco Drive Official Rates ·</span>
-              <span className="font-semibold">{dataSource.availablePricesCount} Active Tariffs</span>
+              <span className="hidden sm:inline">Eco Drive Prices ·</span>
+              <span className="font-semibold">
+                {pricesStats.totalCount > 0
+                  ? `${pricesStats.totalCount} D1 Records`
+                  : 'D1 Ready'}
+              </span>
             </div>
           </div>
         </div>
@@ -178,18 +188,22 @@ export const Header: React.FC<HeaderProps> = ({
         {/* Mobile Navigation Bar */}
         <div className="sm:hidden flex items-center justify-around py-2 border-t border-[#E2E8F0] dark:border-slate-800 text-xs font-medium text-[#64748B] dark:text-slate-400">
           <button
-            onClick={() => setActiveTab('filter')}
+            onClick={() => setActiveTab('prices')}
             className={`flex flex-col items-center gap-1 py-1 px-1.5 rounded-lg ${
-              activeTab === 'filter' ? 'text-[#006B45] dark:text-emerald-300 font-bold bg-[#F0FDF4] dark:bg-emerald-950/70' : ''
+              activeTab === 'prices'
+                ? 'text-[#006B45] dark:text-emerald-300 font-bold bg-[#F0FDF4] dark:bg-emerald-950/70'
+                : ''
             }`}
           >
-            <SlidersHorizontal className="w-4 h-4" />
-            <span className="text-[10px]">Filter</span>
+            <Tag className="w-4 h-4" />
+            <span className="text-[10px]">Prices</span>
           </button>
           <button
             onClick={() => setActiveTab('transport')}
             className={`flex flex-col items-center gap-1 py-1 px-1.5 rounded-lg ${
-              activeTab === 'transport' ? 'text-[#006B45] dark:text-emerald-300 font-bold bg-[#F0FDF4] dark:bg-emerald-950/70' : ''
+              activeTab === 'transport'
+                ? 'text-[#006B45] dark:text-emerald-300 font-bold bg-[#F0FDF4] dark:bg-emerald-950/70'
+                : ''
             }`}
           >
             <Bus className="w-4 h-4" />
@@ -198,7 +212,9 @@ export const Header: React.FC<HeaderProps> = ({
           <button
             onClick={() => setActiveTab('ai-transport-finder')}
             className={`flex flex-col items-center gap-1 py-1 px-1.5 rounded-lg ${
-              activeTab === 'ai-transport-finder' ? 'text-[#006B45] dark:text-emerald-300 font-bold bg-[#F0FDF4] dark:bg-emerald-950/70' : ''
+              activeTab === 'ai-transport-finder'
+                ? 'text-[#006B45] dark:text-emerald-300 font-bold bg-[#F0FDF4] dark:bg-emerald-950/70'
+                : ''
             }`}
           >
             <Sparkles className="w-4 h-4" />
@@ -207,7 +223,9 @@ export const Header: React.FC<HeaderProps> = ({
           <button
             onClick={() => setActiveTab('branches')}
             className={`flex flex-col items-center gap-1 py-1 px-1.5 rounded-lg ${
-              activeTab === 'branches' ? 'text-[#006B45] dark:text-emerald-300 font-bold bg-[#F0FDF4] dark:bg-emerald-950/70' : ''
+              activeTab === 'branches'
+                ? 'text-[#006B45] dark:text-emerald-300 font-bold bg-[#F0FDF4] dark:bg-emerald-950/70'
+                : ''
             }`}
           >
             <MapPin className="w-4 h-4" />
@@ -216,7 +234,9 @@ export const Header: React.FC<HeaderProps> = ({
           <button
             onClick={() => setActiveTab('branch-info')}
             className={`flex flex-col items-center gap-1 py-1 px-1.5 rounded-lg ${
-              activeTab === 'branch-info' ? 'text-[#006B45] dark:text-emerald-300 font-bold bg-[#F0FDF4] dark:bg-emerald-950/70' : ''
+              activeTab === 'branch-info'
+                ? 'text-[#006B45] dark:text-emerald-300 font-bold bg-[#F0FDF4] dark:bg-emerald-950/70'
+                : ''
             }`}
           >
             <Building2 className="w-4 h-4" />
@@ -225,7 +245,9 @@ export const Header: React.FC<HeaderProps> = ({
           <button
             onClick={() => setActiveTab('instructors')}
             className={`flex flex-col items-center gap-1 py-1 px-1.5 rounded-lg ${
-              activeTab === 'instructors' ? 'text-[#006B45] dark:text-emerald-300 font-bold bg-[#F0FDF4] dark:bg-emerald-950/70' : ''
+              activeTab === 'instructors'
+                ? 'text-[#006B45] dark:text-emerald-300 font-bold bg-[#F0FDF4] dark:bg-emerald-950/70'
+                : ''
             }`}
           >
             <Users className="w-4 h-4" />

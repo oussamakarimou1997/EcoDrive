@@ -11,23 +11,30 @@ import {
   clearVerifyRateLimit,
   createBranchInfoInDb,
   createInstructorInDb,
+  createPriceRecordInDb,
   deleteBranchInfoInDb,
   deleteInstructorInDb,
+  deletePriceRecordInDb,
   getAdminAuthStatus,
   getBranchInfoDatasetFromDb,
   getInstructorsDatasetFromDb,
+  getPricesDatasetFromDb,
   recordVerifyFailure,
   replaceBranchInfoDatasetInDb,
   replaceInstructorsDatasetInDb,
+  replacePricesDatasetInDb,
   revokeAdminSessionToken,
+  rollbackPricesDatasetInDb,
   setupInitialAdminAccessCode,
   updateBranchInfoInDb,
   updateInstructorInDb,
+  updatePriceRecordInDb,
   validateAdminSessionToken,
   verifyAdminAccessCodeAndCreateSession,
 } from './db';
 import { DetectedInstructorColumns, InstructorRecord } from '../src/types/instructors';
 import { BranchInfoRecord, DetectedBranchInfoColumns } from '../src/types/branchInfo';
+import { DetectedPriceColumns, PriceRecord } from '../src/types/prices';
 
 const MAX_JSON_BODY_BYTES = 2 * 1024 * 1024; // 2 MB
 
@@ -293,18 +300,65 @@ async function handleReverseGeocode(url: URL, env: Env): Promise<Response> {
 interface AIRecommendationRequestBody {
   studentLocation?: {
     label: string;
-    lat: number;
-    lng: number;
+    lat: number | null;
+    lng: number | null;
   };
+  matchStatus?: 'exact_station' | 'area_no_exact_station';
+  selectedStationName?: string;
   dubaiTime?: {
     weekday: string;
     formattedTime: string;
   };
   selectedDay?: string;
+  studentRequirements?: string;
   nearestStation?: unknown;
+  sameRouteStations?: unknown[];
   nearbyAlternatives?: unknown[];
   activeFilters?: unknown;
   unmappedStationsCount?: number;
+}
+
+function stripJsonCodeFences(rawText: string): string {
+  const trimmed = rawText.trim();
+  const fenceMatch = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  return fenceMatch ? fenceMatch[1].trim() : trimmed;
+}
+
+function isValidAiRecommendationPayload(
+  val: unknown
+): val is {
+  headline: string;
+  recommendations: string[];
+  alternativeTip: string;
+  arrivalReminder: string;
+} {
+  if (!val || typeof val !== 'object') return false;
+  const obj = val as Record<string, unknown>;
+  if (typeof obj.headline !== 'string' || !obj.headline.trim()) return false;
+  if (
+    !Array.isArray(obj.recommendations) ||
+    obj.recommendations.length === 0 ||
+    !obj.recommendations.every((item) => typeof item === 'string' && item.trim().length > 0)
+  ) {
+    return false;
+  }
+  if (typeof obj.alternativeTip !== 'string') return false;
+  if (typeof obj.arrivalReminder !== 'string') return false;
+  return true;
+}
+
+function isTransientGeminiError(message: string): boolean {
+  const upper = message.toUpperCase();
+  return (
+    upper.includes('429') ||
+    upper.includes('RESOURCE_EXHAUSTED') ||
+    upper.includes('503') ||
+    upper.includes('500') ||
+    upper.includes('UNAVAILABLE') ||
+    upper.includes('DEADLINE_EXCEEDED') ||
+    upper.includes('TIMEOUT') ||
+    upper.includes('NETWORK')
+  );
 }
 
 async function handleAiRecommendations(request: Request, env: Env): Promise<Response> {
@@ -329,9 +383,24 @@ async function handleAiRecommendations(request: Request, env: Env): Promise<Resp
     return jsonResponse({ error: 'Invalid request body.' }, 400);
   }
 
-  if (!payload || !payload.studentLocation) {
-    return jsonResponse({ error: 'Missing student location context.' }, 400);
+  if (
+    !payload ||
+    !payload.studentLocation ||
+    typeof payload.studentLocation.label !== 'string' ||
+    !payload.studentLocation.label.trim()
+  ) {
+    return jsonResponse({ error: 'Missing valid student location or station context.' }, 400);
   }
+
+  const sanitizedRequirements =
+    typeof payload.studentRequirements === 'string'
+      ? payload.studentRequirements.trim().slice(0, 500)
+      : undefined;
+
+  const modelPayload: AIRecommendationRequestBody = {
+    ...payload,
+    studentRequirements: sanitizedRequirements || undefined,
+  };
 
   try {
     const ai = new GoogleGenAI({
@@ -344,82 +413,149 @@ async function handleAiRecommendations(request: Request, env: Env): Promise<Resp
     });
 
     const systemInstruction = `You are the Eco Drive Driving Institute Smart Transportation Assistant in Dubai.
-Your ONLY job is to explain and summarize verified transportation search results in clear, helpful student-friendly guidance.
+Your ONLY job is to explain and summarize verified transportation search results in clear, factual, student-friendly guidance.
 
-STRICT GROUNDING RULES:
-1. ONLY reference station names, landmarks, straight-line distances, walking distances/times, departure times, route codes, school branches, and operating days that are explicitly present in the provided JSON context.
-2. NEVER invent, estimate, or alter any bus departure times, station names, distances, walking durations, or operating days.
-3. Explicitly distinguish between "straight-line distance" and "walking distance/time" whenever mentioning distance. If walkingDistanceMeters is null or absent, state clearly that walking route data is unavailable and only cite the straight-line distance.
-4. If nearestStation is null (e.g. no stations match the student's active filters), clearly explain that no verified station matched the current filters and suggest relaxing the filters (like maximum distance or branch).
-5. Remind the student to arrive 5–10 minutes early at the pickup point and use the "Open in Google Maps" button for exact navigation.`;
+STRICT ACCURACY & GROUNDING RULES:
+1. ONLY reference station names, landmarks, straight-line distances, walking distances/times, departure times, route codes, same-route stops, school branches, and operating days that are explicitly present in the provided JSON context.
+2. NEVER invent, estimate, or alter any bus departure times, station names, connections, routes, distances, walking durations, travel times, or operating days.
+3. RESPECT STATION MATCH STATUS:
+   - If matchStatus is "exact_station", the student explicitly selected the official station named in selectedStationName (and nearestStation). Base all primary guidance strictly on that exact station and NEVER suggest replacing it with a different station.
+   - If matchStatus is "area_no_exact_station", clearly state that studentLocation.label has NO exact Eco Drive pickup stop on the selected branch schedule, and present nearestStation and nearbyAlternatives strictly as "optional nearby alternatives" sorted by distance from studentLocation.label. Never claim an alternative station IS the searched neighborhood.
+4. DISTINGUISH RELATIONSHIPS CLEARLY:
+   - "Primary / Selected Station" (nearestStation)
+   - "Same-Route Stations" (sameRouteStations: sequential stops on the same bus line)
+   - "Optional Nearby Alternatives" (nearbyAlternatives: nearby stops sorted by geographic distance)
+   Never confuse same-route stops with geographically nearby alternatives unless both facts appear explicitly in the JSON.
+5. Explicitly distinguish between "straight-line distance" and "walking distance/time" whenever mentioning distance. If walkingDistanceMeters is null or absent, state clearly that walking route data is unavailable.
+6. If nearestStation is null or has zero departures for the active filters, state clearly that verified data is unavailable under the current filters and suggest relaxing the filters rather than guessing.
+7. Remind the student to arrive 5–10 minutes early at the pickup point and use the "Open in Google Maps" button when station coordinates are available.
+8. If studentRequirements is present in the JSON context, directly address those student requirements using ONLY the verified data provided.`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
-      contents: `Analyze this verified Eco Drive bus search result and generate concise, accurate recommendations for the student:\n${JSON.stringify(payload)}`,
-      config: {
-        systemInstruction,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            headline: {
-              type: Type.STRING,
-              description:
-                'A clear 1-sentence summary identifying the nearest verified station and distance.',
-            },
-            recommendations: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-              description:
-                '3 to 5 factual bullet points covering exact station, distance, next bus timing, landmark, and Google Maps navigation.',
-            },
-            alternativeTip: {
-              type: Type.STRING,
-              description:
-                '1 concise tip comparing nearby alternative stations if available, or explaining filter status if none.',
-            },
-            arrivalReminder: {
-              type: Type.STRING,
-              description:
-                'Brief practical reminder about arriving 5-10 minutes before departure and verifying operating schedule.',
+    let response: Awaited<ReturnType<typeof ai.models.generateContent>> | null = null;
+    let lastErr: unknown = null;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        response = await ai.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents: `Analyze this verified Eco Drive bus search result and generate concise, accurate recommendations for the student:\n${JSON.stringify(modelPayload)}`,
+          config: {
+            systemInstruction,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                headline: {
+                  type: Type.STRING,
+                  description:
+                    'A clear 1-sentence summary stating either the exact selected station or that the searched location has no direct Eco Drive stop and naming the closest optional alternative.',
+                },
+                recommendations: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                  description:
+                    '3 to 5 factual bullet points covering match status, exact/alternative station, same-route line stops if relevant, distance, next bus timing, landmark, and student requirements.',
+                },
+                alternativeTip: {
+                  type: Type.STRING,
+                  description:
+                    '1 concise tip comparing optional nearby alternative stations or same-route stops strictly from the JSON, or explaining filter adjustments if none.',
+                },
+                arrivalReminder: {
+                  type: Type.STRING,
+                  description:
+                    'Brief practical reminder about arriving 5-10 minutes before departure and verifying operating schedule.',
+                },
+              },
+              required: ['headline', 'recommendations', 'alternativeTip', 'arrivalReminder'],
             },
           },
-          required: ['headline', 'recommendations', 'alternativeTip', 'arrivalReminder'],
-        },
-      },
-    });
+        });
+        break;
+      } catch (attemptErr: unknown) {
+        lastErr = attemptErr;
+        const msg =
+          attemptErr instanceof Error ? attemptErr.message : String(attemptErr || '');
+        if (attempt < 2 && isTransientGeminiError(msg)) {
+          const delayMs = 300 * Math.pow(3, attempt);
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          continue;
+        }
+        throw attemptErr;
+      }
+    }
+
+    if (!response) {
+      throw lastErr || new Error('AI request failed after retries.');
+    }
 
     const rawText = response.text?.trim();
     if (!rawText) {
       return jsonResponse({ error: 'AI returned an empty recommendation response.' }, 502);
     }
 
-    const parsed = JSON.parse(rawText);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(stripJsonCodeFences(rawText));
+    } catch {
+      return jsonResponse(
+        { error: 'AI returned a malformed response format. Please click Retry AI.' },
+        502
+      );
+    }
+
+    if (!isValidAiRecommendationPayload(parsed)) {
+      return jsonResponse(
+        { error: 'AI response was missing required guidance fields. Please click Retry AI.' },
+        502
+      );
+    }
+
     return jsonResponse(parsed, 200);
   } catch (err: unknown) {
     console.error('Gemini AI recommendations error:', err);
     const message =
       err instanceof Error ? err.message : 'Failed to generate AI recommendations.';
+    const upper = message.toUpperCase();
+
     if (
-      message.includes('PERMISSION_DENIED') ||
-      message.includes('API_KEY_INVALID') ||
-      message.includes('403') ||
-      message.includes('400')
+      upper.includes('PERMISSION_DENIED') ||
+      upper.includes('API_KEY_INVALID') ||
+      upper.includes('API KEY NOT VALID') ||
+      upper.includes('UNAUTHENTICATED') ||
+      upper.includes('401') ||
+      upper.includes('403')
     ) {
       return jsonResponse(
         {
           error:
-            'Invalid or missing Gemini API key. Please verify GEMINI_API_KEY in Cloudflare Workers Secrets.',
+            'Invalid or unauthorized Gemini API key. Please verify GEMINI_API_KEY in Cloudflare Workers Secrets.',
         },
         401
       );
     }
-    if (message.includes('RESOURCE_EXHAUSTED') || message.includes('429')) {
+    if (upper.includes('RESOURCE_EXHAUSTED') || upper.includes('429')) {
       return jsonResponse(
         {
           error: 'Gemini API rate limit reached. Please try again shortly.',
         },
         429
+      );
+    }
+    if (upper.includes('NOT_FOUND') || upper.includes('404')) {
+      return jsonResponse(
+        {
+          error: 'Configured Gemini model is currently unavailable. Please try again later.',
+        },
+        502
+      );
+    }
+    if (upper.includes('INVALID_ARGUMENT') || upper.includes('400')) {
+      return jsonResponse(
+        {
+          error: `Gemini rejected the search request: ${message}`,
+        },
+        400
       );
     }
     return jsonResponse({ error: message }, 502);
@@ -821,6 +957,150 @@ async function handleApiRequest(request: Request, env: Env, url: URL): Promise<R
           console.error('Error deleting branch info:', err);
           return jsonResponse(
             { error: 'Failed to delete branch from database.' },
+            500
+          );
+        }
+      }
+    }
+
+    // 5. Prices Catalog CRUD, Excel Import & Rollback Routes (Cloudflare D1)
+    if (pathname === '/api/prices' && method === 'GET') {
+      try {
+        const dataset = await getPricesDatasetFromDb(env.DB);
+        return jsonResponse(dataset, 200);
+      } catch (err) {
+        console.error('Error loading prices from database:', err);
+        return jsonResponse({ error: 'Failed to load Prices catalog from database.' }, 500);
+      }
+    }
+
+    if (pathname === '/api/prices' && method === 'POST') {
+      const authError = await requireAdminAuth(request, env);
+      if (authError) return authError;
+
+      try {
+        const body = await readJsonBody<{
+          fields?: Record<string, unknown>;
+          sheetName?: string;
+          category?: string;
+          productName?: string;
+          priceDisplay?: string;
+          currency?: string;
+        }>(request);
+        const created = await createPriceRecordInDb(env.DB, body);
+        return jsonResponse({ record: created }, 201);
+      } catch (err) {
+        if (err instanceof BadJsonError) {
+          return jsonResponse({ error: err.message }, err.status);
+        }
+        if (err instanceof ValidationError) {
+          return jsonResponse({ error: err.message, fieldErrors: err.fieldErrors }, 400);
+        }
+        console.error('Error creating price record:', err);
+        return jsonResponse({ error: 'Failed to save price record to database.' }, 500);
+      }
+    }
+
+    if (pathname === '/api/prices/import' && method === 'POST') {
+      const authError = await requireAdminAuth(request, env);
+      if (authError) return authError;
+
+      try {
+        const body = await readJsonBody<{
+          fileName: string;
+          sheetNames: string[];
+          columns: string[];
+          detectedColumns: DetectedPriceColumns;
+          records: PriceRecord[];
+          notes: string[];
+          contentHash: string;
+          importedAt: string;
+        }>(request);
+        const dataset = await replacePricesDatasetInDb(env.DB, body);
+        return jsonResponse(dataset, 200);
+      } catch (err) {
+        if (err instanceof BadJsonError) {
+          return jsonResponse({ error: err.message }, err.status);
+        }
+        if (err instanceof ValidationError) {
+          return jsonResponse({ error: err.message, fieldErrors: err.fieldErrors }, 400);
+        }
+        console.error('Error importing prices dataset:', err);
+        return jsonResponse({ error: 'Failed to save imported Prices dataset to database.' }, 500);
+      }
+    }
+
+    if (pathname === '/api/prices/rollback' && method === 'POST') {
+      const authError = await requireAdminAuth(request, env);
+      if (authError) return authError;
+
+      try {
+        const dataset = await rollbackPricesDatasetInDb(env.DB);
+        return jsonResponse(dataset, 200);
+      } catch (err) {
+        if (err instanceof NotFoundError) {
+          return jsonResponse({ error: err.message }, 404);
+        }
+        console.error('Error rolling back prices dataset:', err);
+        return jsonResponse({ error: 'Failed to restore previous Prices backup.' }, 500);
+      }
+    }
+
+    const priceItemMatch = pathname.match(/^\/api\/prices\/([^/]+)$/);
+    if (priceItemMatch) {
+      let rowKey: string;
+      try {
+        rowKey = decodeURIComponent(priceItemMatch[1]);
+      } catch {
+        return jsonResponse({ error: 'Invalid price identifier.' }, 400);
+      }
+
+      if (method === 'PUT') {
+        const authError = await requireAdminAuth(request, env);
+        if (authError) return authError;
+
+        try {
+          const body = await readJsonBody<{
+            fields?: Record<string, unknown>;
+            category?: string;
+            productName?: string;
+            priceDisplay?: string;
+            currency?: string;
+          }>(request);
+          const updated = await updatePriceRecordInDb(env.DB, rowKey, body);
+          return jsonResponse({ record: updated }, 200);
+        } catch (err) {
+          if (err instanceof BadJsonError) {
+            return jsonResponse({ error: err.message }, err.status);
+          }
+          if (err instanceof ValidationError) {
+            return jsonResponse(
+              { error: err.message, fieldErrors: err.fieldErrors },
+              400
+            );
+          }
+          if (err instanceof NotFoundError) {
+            return jsonResponse({ error: err.message }, 404);
+          }
+          console.error('Error updating price record:', err);
+          return jsonResponse({ error: 'Failed to update price record in database.' }, 500);
+        }
+      }
+
+      if (method === 'DELETE') {
+        const authError = await requireAdminAuth(request, env);
+        if (authError) return authError;
+
+        try {
+          await deletePriceRecordInDb(env.DB, rowKey);
+          return jsonResponse({ deleted: true, rowKey }, 200);
+        } catch (err) {
+          if (err instanceof NotFoundError) {
+            return jsonResponse({ error: err.message }, 404);
+          }
+          console.error('Error deleting price record:', err);
+          return jsonResponse(
+            { error: 'Failed to delete price record from database.' },
             500
           );
         }

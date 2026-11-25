@@ -6,6 +6,7 @@ import {
   NextBusInfo,
   OperatingDayOption,
   RankedStationResult,
+  SameRouteLineInfo,
   SmartTransportFilters,
   StationDeparture,
   TimePeriod,
@@ -66,6 +67,7 @@ export const QUICK_DUBAI_AREAS: Array<{ label: string; query: string }> = [
   { label: 'Al Barsha', query: 'Al Barsha, Dubai, UAE' },
   { label: 'Business Bay', query: 'Business Bay, Dubai, UAE' },
   { label: 'Deira', query: 'Deira, Dubai, UAE' },
+  { label: 'Al Rigga', query: 'Al Rigga, Dubai, UAE' },
   { label: 'Jumeirah', query: 'Jumeirah, Dubai, UAE' },
   { label: 'Discovery Gardens', query: 'Discovery Gardens, Dubai, UAE' },
   { label: 'Dubai Silicon Oasis', query: 'Dubai Silicon Oasis, Dubai, UAE' },
@@ -459,6 +461,157 @@ export function filterAndRankStations(
   mapped.sort((a, b) => a.straightLineKm - b.straightLineKm);
 
   return { ranked: mapped, unmappedStations };
+}
+
+/**
+ * Normalizes station / place names for strict canonical matching against official Eco Drive stops.
+ * Never fuzzy-matches different neighborhoods (e.g. "Al Rigga" will NEVER match "Burjuman" or "Union").
+ */
+export function normalizeStationNameText(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/[,().\-_/]+/g, ' ')
+    .replace(/\b(united arab emirates|uae|dubai|sharjah)\b/g, ' ')
+    .replace(/\b(bus station|metro station|bus stop|station|stop|metro|branch)\b/g, ' ')
+    .replace(/\bcenter\b/g, 'centre')
+    .replace(/\bbur\s+juman\b/g, 'burjuman')
+    .replace(/\bsatwa\s+bus\b/g, 'satwa')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Matches a user-typed query ONLY when it unambiguously names an official Eco Drive pickup stop
+ * in the selected branch. Returns null for non-stop areas such as "Al Rigga".
+ */
+export function matchOfficialStationQuery(
+  query: string,
+  stations: TransportStation[],
+  selectedBranch: BranchCode | null
+): TransportStation | null {
+  if (!selectedBranch) return null;
+  const normalizedQuery = normalizeStationNameText(query);
+  if (!normalizedQuery || normalizedQuery.length < 3) return null;
+
+  const branchStations = stations.filter((s) => s.branchCode === selectedBranch);
+
+  // 1. Exact raw name match (case-insensitive)
+  const rawLower = query.trim().toLowerCase();
+  const exactRaw = branchStations.find(
+    (s) => s.name.trim().toLowerCase() === rawLower || s.areaLabel.trim().toLowerCase() === rawLower
+  );
+  if (exactRaw) return exactRaw;
+
+  // 2. Canonical normalized match (e.g. "Union Metro Station" -> "Union", "Deira City Centre" -> "Deira City Center")
+  const canonicalMatches = branchStations.filter((s) => {
+    const normStop = normalizeStationNameText(s.name);
+    if (!normStop) return false;
+    return normStop === normalizedQuery;
+  });
+
+  if (canonicalMatches.length >= 1) {
+    return canonicalMatches.find((s) => s.hasCoordinates) || canonicalMatches[0];
+  }
+
+  return null;
+}
+
+/**
+ * Builds a RankedStationResult for an explicitly selected station WITHOUT replacing it
+ * with another station even if filters would exclude it or if it lacks GPS coordinates.
+ */
+export function buildExactStationResult(
+  station: TransportStation,
+  selectedBranch: BranchCode,
+  studentLocation: LatLng | null,
+  filters: SmartTransportFilters,
+  dubaiNowWeekday: string
+): RankedStationResult {
+  const effectiveWeekday =
+    filters.operatingDay === 'today' ? dubaiNowWeekday : filters.operatingDay;
+
+  const filteredDepartures = filterStationDepartures(
+    station.departures,
+    selectedBranch,
+    filters,
+    effectiveWeekday
+  );
+
+  const straightLineKm =
+    studentLocation && station.coordinates
+      ? calculateHaversineKm(studentLocation, station.coordinates)
+      : 0;
+
+  return {
+    station,
+    straightLineKm,
+    filteredDepartures,
+  };
+}
+
+/**
+ * Extracts all stations sharing the same official bus route / transportation line(s)
+ * as the given station within selectedBranch, preserving exact route stop sequence.
+ */
+export function getSameRouteStations(
+  station: TransportStation,
+  selectedBranch: BranchCode,
+  allStations: TransportStation[]
+): SameRouteLineInfo[] {
+  const targetCenterId = BRANCH_META[selectedBranch].centerId;
+  const branchStations = allStations.filter((s) => s.branchCode === selectedBranch);
+  const stationStopIds = new Set(station.routes.map((r) => r.stopId));
+  const stationRouteIds = new Set(station.routes.map((r) => r.routeId));
+
+  const lines: SameRouteLineInfo[] = [];
+
+  for (const route of TRANSPORT_ROUTES) {
+    if (route.centerId !== targetCenterId) continue;
+    if (!stationRouteIds.has(route.id)) continue;
+
+    let currentStopIndex = -1;
+    const stops = route.stops.map((stop, idx) => {
+      const isCurrent = stationStopIds.has(stop.id) || stop.name.trim().toLowerCase() === station.name.trim().toLowerCase();
+      if (isCurrent && currentStopIndex === -1) {
+        currentStopIndex = idx;
+      }
+
+      const matchedStation =
+        branchStations.find((st) => st.routes.some((r) => r.stopId === stop.id)) ||
+        branchStations.find(
+          (st) =>
+            normalizeStationNameText(st.name) === normalizeStationNameText(stop.name)
+        ) ||
+        null;
+
+      const sampleTimes = route.trips
+        .map((t) => t.stopTimes[stop.id])
+        .filter((val): val is string => Boolean(val));
+
+      return {
+        stopId: stop.id,
+        stationId: matchedStation?.id || null,
+        name: stop.name.replace(/\s+Branch$/i, ''),
+        landmark: stop.landmark,
+        isCurrent,
+        hasCoordinates: Boolean(matchedStation?.hasCoordinates),
+        sampleTimes,
+      };
+    });
+
+    lines.push({
+      routeId: route.id,
+      routeCode: route.routeCode,
+      routeTitle: route.title,
+      scheduleType: route.scheduleType,
+      capacity: route.capacity,
+      destinationName: route.centerEtaName,
+      currentStopIndex,
+      stops,
+    });
+  }
+
+  return lines;
 }
 
 /**

@@ -8,7 +8,6 @@ import {
   Clock,
   ExternalLink,
   RotateCcw,
-  SlidersHorizontal,
   Compass,
   AlertCircle,
   CheckCircle2,
@@ -23,22 +22,22 @@ import {
   Eye,
   Building2,
   Lock,
+  GitBranch,
 } from 'lucide-react';
 import { TRANSPORT_ROUTES } from '../data/transportationData';
 import {
   AIRecommendationResponse,
   BranchCode,
-  OperatingDayOption,
   ResolvedPinsResponse,
   SmartTransportFilters,
+  StationMatchType,
   StudentLocation,
-  TimeFilterOption,
   TransportStation,
   WalkingRouteInfo,
 } from '../types/smartTransport';
 import {
   BRANCH_META,
-  QUICK_DUBAI_AREAS,
+  buildExactStationResult,
   buildGoogleMapsDirectionsUrl,
   buildStationsFromSource,
   computeNextBus,
@@ -48,7 +47,9 @@ import {
   formatStraightLineDistance,
   formatWalkingDistance,
   getDubaiNow,
+  getSameRouteStations,
   getTimePeriodLabel,
+  matchOfficialStationQuery,
 } from '../utils/transportFinderUtils';
 import { AddressAutocompleteInput } from './AddressAutocompleteInput';
 import { SmartTransportMap } from './SmartTransportMap';
@@ -60,17 +61,6 @@ const DEFAULT_FILTERS: SmartTransportFilters = {
   operatingDay: 'today',
   maxDistanceKm: null,
 };
-
-const OPERATING_DAYS: Array<{ value: OperatingDayOption; label: string }> = [
-  { value: 'today', label: 'Today (Dubai Local Time)' },
-  { value: 'Sunday', label: 'Sunday' },
-  { value: 'Monday', label: 'Monday' },
-  { value: 'Tuesday', label: 'Tuesday' },
-  { value: 'Wednesday', label: 'Wednesday' },
-  { value: 'Thursday', label: 'Thursday' },
-  { value: 'Friday', label: 'Friday' },
-  { value: 'Saturday', label: 'Saturday' },
-];
 
 const DUBAI_QUICK_BOUNDS: google.maps.LatLngBoundsLiteral = {
   north: 25.45,
@@ -144,19 +134,21 @@ const AISmartTransportFinderContent: React.FC = () => {
   // 3. Mandatory Step 1: Destination Branch Selection (NEVER auto-selected)
   const [selectedBranch, setSelectedBranch] = useState<BranchCode | null>(null);
 
-  // 4. Step 2: Residential Location Input State
+  // 4. Step 2: Residential Location OR Exact Official Station Selection State
   const [addressInput, setAddressInput] = useState('');
   const [pendingLocation, setPendingLocation] = useState<StudentLocation | null>(null);
   const [activeLocation, setActiveLocation] = useState<StudentLocation | null>(null);
+  const [exactStationId, setExactStationId] = useState<string | null>(null);
+  const [activeMatchType, setActiveMatchType] = useState<StationMatchType>('area_no_exact_station');
   const [hasSearched, setHasSearched] = useState(false);
+  const [searchBusy, setSearchBusy] = useState(false);
 
   const [isPickerMode, setIsPickerMode] = useState(false);
   const [geoLoading, setGeoLoading] = useState(false);
   const [geoError, setGeoError] = useState<string | null>(null);
   const [validationError, setValidationError] = useState<string | null>(null);
-  const [quickAreaLoading, setQuickAreaLoading] = useState<string | null>(null);
 
-  // 5. Branch-Scoped Refinement Filters & Selection State
+  // 5. Branch-Scoped Refinement Filters & Optional Inspected Alternative State
   const [filters, setFilters] = useState<SmartTransportFilters>(DEFAULT_FILTERS);
   const [overrideStationId, setOverrideStationId] = useState<string | null>(null);
   const [modalStation, setModalStation] = useState<TransportStation | null>(null);
@@ -166,6 +158,7 @@ const AISmartTransportFinderContent: React.FC = () => {
   const [walkingRouteInfo, setWalkingRouteInfo] = useState<WalkingRouteInfo>({ status: 'idle' });
 
   // 7. AI Recommendations State
+  const [aiRefreshNonce, setAiRefreshNonce] = useState(0);
   const [aiData, setAiData] = useState<AIRecommendationResponse | null>(null);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
@@ -175,13 +168,15 @@ const AISmartTransportFinderContent: React.FC = () => {
   const resultsSectionRef = useRef<HTMLDivElement>(null);
   const scheduleSectionRef = useRef<HTMLElement>(null);
 
-  // Stations belonging STRICTLY to selectedBranch (never mixes DIC & AL_QUOZ)
-  const branchMappedStations = useMemo(() => {
+  // All stations belonging STRICTLY to selectedBranch (never mixes DIC & AL_QUOZ)
+  const allBranchStations = useMemo(() => {
     if (!selectedBranch) return [];
-    return allStations.filter(
-      (s) => s.branchCode === selectedBranch && s.hasCoordinates && s.coordinates !== null
-    );
+    return allStations.filter((s) => s.branchCode === selectedBranch);
   }, [allStations, selectedBranch]);
+
+  const branchMappedStations = useMemo(() => {
+    return allBranchStations.filter((s) => s.hasCoordinates && s.coordinates !== null);
+  }, [allBranchStations]);
 
   // School centre pin for ONLY the selected branch
   const schoolCenters = useMemo(() => {
@@ -195,32 +190,100 @@ const AISmartTransportFinderContent: React.FC = () => {
     return [];
   }, [selectedBranch, pinsData.centers]);
 
-  // Compute ranked stations strictly scoped to selectedBranch
-  const { ranked, unmappedStations } = useMemo(
-    () =>
-      filterAndRankStations(
-        allStations,
+  const exactSelectedStation = useMemo(() => {
+    if (!exactStationId || !selectedBranch) return null;
+    return allBranchStations.find((s) => s.id === exactStationId) || null;
+  }, [exactStationId, selectedBranch, allBranchStations]);
+
+  // Anchor coordinates for distance calculations (student's location OR exact station's coordinates)
+  const distanceOrigin = useMemo(() => {
+    if (!hasSearched) return null;
+    if (activeLocation) return { lat: activeLocation.lat, lng: activeLocation.lng };
+    if (exactSelectedStation?.coordinates) return exactSelectedStation.coordinates;
+    return null;
+  }, [hasSearched, activeLocation, exactSelectedStation]);
+
+  // Compute ranked stations strictly scoped to selectedBranch (for optional nearby alternatives)
+  const { ranked, unmappedStations } = useMemo(() => {
+    const alternativeFilters: SmartTransportFilters =
+      exactStationId && activeMatchType === 'exact_station'
+        ? { ...filters, preferredStationId: 'all' }
+        : filters;
+
+    return filterAndRankStations(
+      allStations,
+      selectedBranch,
+      distanceOrigin,
+      alternativeFilters,
+      dubaiNow.weekday
+    );
+  }, [
+    allStations,
+    selectedBranch,
+    distanceOrigin,
+    filters,
+    exactStationId,
+    activeMatchType,
+    dubaiNow.weekday,
+  ]);
+
+  // Primary station result:
+  // - If user explicitly selected an exact station (e.g. Union, Burjuman, Abu Hail), NEVER replace it.
+  // - Otherwise (e.g. Al Rigga), show the user-inspected alternative or closest verified alternative.
+  const primaryResult = useMemo(() => {
+    if (!selectedBranch || !hasSearched) return null;
+
+    if (overrideStationId) {
+      const altMatch = ranked.find((r) => r.station.id === overrideStationId);
+      if (altMatch) return altMatch;
+      const rawAlt = allBranchStations.find((s) => s.id === overrideStationId);
+      if (rawAlt) {
+        return buildExactStationResult(rawAlt, selectedBranch, distanceOrigin, filters, dubaiNow.weekday);
+      }
+    }
+
+    if (activeMatchType === 'exact_station' && exactSelectedStation) {
+      return buildExactStationResult(
+        exactSelectedStation,
         selectedBranch,
-        hasSearched ? activeLocation : null,
+        activeLocation,
         filters,
         dubaiNow.weekday
-      ),
-    [allStations, selectedBranch, hasSearched, activeLocation, filters, dubaiNow.weekday]
-  );
-
-  // Primary recommended station (or user-inspected alternative from the SAME branch)
-  const primaryResult = useMemo(() => {
-    if (ranked.length === 0) return null;
-    if (overrideStationId) {
-      const match = ranked.find((r) => r.station.id === overrideStationId);
-      if (match) return match;
+      );
     }
-    return ranked[0];
-  }, [ranked, overrideStationId]);
+
+    return ranked[0] || null;
+  }, [
+    selectedBranch,
+    hasSearched,
+    overrideStationId,
+    ranked,
+    allBranchStations,
+    activeMatchType,
+    exactSelectedStation,
+    distanceOrigin,
+    activeLocation,
+    filters,
+    dubaiNow.weekday,
+  ]);
+
+  const isViewingExactStation = Boolean(
+    primaryResult &&
+      activeMatchType === 'exact_station' &&
+      exactSelectedStation &&
+      primaryResult.station.id === exactSelectedStation.id &&
+      !overrideStationId
+  );
 
   const closestOverallResult = ranked[0] || null;
 
-  // Next 3 closest alternative stops belonging ONLY to selectedBranch
+  // Same-route stations strictly along the same official bus line(s)
+  const sameRouteLines = useMemo(() => {
+    if (!primaryResult || !selectedBranch) return [];
+    return getSameRouteStations(primaryResult.station, selectedBranch, allStations);
+  }, [primaryResult, selectedBranch, allStations]);
+
+  // Next 3 closest optional nearby alternative stops belonging ONLY to selectedBranch
   const otherNearbyResults = useMemo(() => {
     if (!primaryResult) return [];
     return ranked.filter((r) => r.station.id !== primaryResult.station.id).slice(0, 3);
@@ -240,6 +303,8 @@ const AISmartTransportFinderContent: React.FC = () => {
   const handleSelectBranch = (branch: BranchCode) => {
     if (selectedBranch === branch) return;
     setSelectedBranch(branch);
+    setExactStationId(null);
+    setActiveMatchType('area_no_exact_station');
     setOverrideStationId(null);
     setFilters((f) => ({ ...f, preferredStationId: 'all' }));
     setWalkingRouteInfo({ status: 'idle' });
@@ -249,35 +314,222 @@ const AISmartTransportFinderContent: React.FC = () => {
     setGeoError(null);
   };
 
+  // Resolve free-text area query only when user didn't already pick a suggestion or exact station
+  const resolveAreaTextToLocation = useCallback(
+    async (rawQuery: string): Promise<StudentLocation | null> => {
+      const trimmed = rawQuery.trim();
+      if (!trimmed) return null;
+
+      try {
+        const resp = await fetch(`/api/maps/geocode?address=${encodeURIComponent(trimmed)}`);
+        const data = (await resp.json()) as {
+          quotaExceeded?: boolean;
+          result?: { lat: number; lng: number; formattedAddress: string } | null;
+        };
+        if (resp.status === 429 || data.quotaExceeded) {
+          window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
+        }
+        if (resp.ok && data.result) {
+          return {
+            lat: data.result.lat,
+            lng: data.result.lng,
+            label: data.result.formattedAddress,
+            areaName: trimmed,
+            source: 'autocomplete',
+          };
+        }
+      } catch {
+        // Fall through to Google Places client SDK
+      }
+
+      if (placesLib?.Place?.searchByText) {
+        try {
+          const { places } = await placesLib.Place.searchByText({
+            textQuery: trimmed.toLowerCase().includes('dubai') ? trimmed : `${trimmed}, Dubai, UAE`,
+            fields: ['displayName', 'formattedAddress', 'location'],
+            locationBias: DUBAI_QUICK_BOUNDS,
+            region: 'AE',
+            maxResultCount: 1,
+          });
+          const found = places?.[0];
+          if (found?.location) {
+            return {
+              lat: found.location.lat(),
+              lng: found.location.lng(),
+              label: found.formattedAddress || found.displayName || trimmed,
+              areaName: found.displayName || trimmed,
+              source: 'autocomplete',
+            };
+          }
+        } catch (placesErr: unknown) {
+          const msg = String(placesErr instanceof Error ? placesErr.message : placesErr || '');
+          if (
+            msg.includes('RESOURCE_EXHAUSTED') ||
+            msg.includes('OVER_QUERY_LIMIT') ||
+            msg.includes('429')
+          ) {
+            window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
+          }
+        }
+      }
+
+      return null;
+    },
+    [placesLib]
+  );
+
+  // Direct Official Station selection (strictly preserves selected station)
+  const handleSelectDirectOfficialStation = useCallback(
+    (station: TransportStation, autoRun = true) => {
+      setExactStationId(station.id);
+      setActiveMatchType('exact_station');
+      setOverrideStationId(null);
+      setFilters((f) => ({ ...f, preferredStationId: station.id }));
+      setAddressInput(station.name);
+      setValidationError(null);
+      setGeoError(null);
+
+      const stationLoc: StudentLocation | null = station.coordinates
+        ? {
+            lat: station.coordinates.lat,
+            lng: station.coordinates.lng,
+            label: `${station.name} (Official Eco Drive Station)`,
+            areaName: station.name,
+            source: 'autocomplete',
+          }
+        : null;
+
+      setPendingLocation(stationLoc);
+
+      if (autoRun) {
+        setActiveLocation(stationLoc);
+        setWalkingRouteInfo({ status: 'idle' });
+        setAiData(null);
+        setAiError(null);
+        setHasSearched(true);
+        setAiRefreshNonce((n) => n + 1);
+        window.setTimeout(() => {
+          resultsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }, 100);
+      }
+    },
+    []
+  );
+
   // Validate and trigger branch-specific search (Step 3)
   const runBranchValidatedSearch = useCallback(
-    (locCandidate?: StudentLocation | null) => {
+    async (locCandidate?: StudentLocation | null) => {
       if (!selectedBranch) {
         setValidationError('Please select your preferred Eco Drive branch first.');
         setHasSearched(false);
         return;
       }
-      const target = locCandidate ?? pendingLocation ?? activeLocation;
+
+      // Check if typed query or explicit station picker selected an official station
+      const typedStationMatch =
+        !locCandidate && addressInput.trim()
+          ? matchOfficialStationQuery(addressInput, allStations, selectedBranch)
+          : null;
+
+      const resolvedExactStation =
+        exactSelectedStation ||
+        typedStationMatch ||
+        (filters.preferredStationId !== 'all'
+          ? allBranchStations.find((s) => s.id === filters.preferredStationId) || null
+          : null);
+
+      let target = locCandidate ?? pendingLocation ?? activeLocation;
+
+      // If user typed an address/area (e.g. "Al Rigga") without clicking dropdown, resolve it now
+      if (!target && addressInput.trim() && !resolvedExactStation) {
+        setSearchBusy(true);
+        setValidationError(null);
+        const resolved = await resolveAreaTextToLocation(addressInput);
+        setSearchBusy(false);
+        if (resolved) {
+          target = resolved;
+          setPendingLocation(resolved);
+          setAddressInput(resolved.label);
+        }
+      }
+
+      // Exact station without needing residential address coordinates
+      if (resolvedExactStation) {
+        setValidationError(null);
+        setGeoError(null);
+        setExactStationId(resolvedExactStation.id);
+        setActiveMatchType('exact_station');
+        setOverrideStationId(null);
+        if (!target && resolvedExactStation.coordinates) {
+          target = {
+            lat: resolvedExactStation.coordinates.lat,
+            lng: resolvedExactStation.coordinates.lng,
+            label: `${resolvedExactStation.name} (Official Eco Drive Station)`,
+            areaName: resolvedExactStation.name,
+            source: 'autocomplete',
+          };
+          setPendingLocation(target);
+        }
+        setActiveLocation(target || null);
+        setWalkingRouteInfo({ status: 'idle' });
+        setAiData(null);
+        setAiError(null);
+        setHasSearched(true);
+        setAiRefreshNonce((n) => n + 1);
+        window.setTimeout(() => {
+          resultsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }, 100);
+        return;
+      }
+
       if (!target) {
         setValidationError(
-          'Please enter your residential address or select your location on the map.'
+          addressInput.trim()
+            ? `Could not verify reliable Dubai coordinates for "${addressInput.trim()}". Please select a suggestion from the dropdown, pick your point on the map, or select an official Eco Drive station directly.`
+            : 'Please enter your residential address, pick a location on the map, or choose an official Eco Drive station.'
         );
         setHasSearched(false);
         return;
       }
+
+      // Check if selected place label itself matches an official station
+      const locationStationMatch = matchOfficialStationQuery(
+        target.areaName || target.label,
+        allStations,
+        selectedBranch
+      );
+
       setValidationError(null);
       setGeoError(null);
       setActiveLocation(target);
       setOverrideStationId(null);
+      if (locationStationMatch) {
+        setExactStationId(locationStationMatch.id);
+        setActiveMatchType('exact_station');
+      } else {
+        setExactStationId(null);
+        setActiveMatchType('area_no_exact_station');
+      }
       setWalkingRouteInfo({ status: 'idle' });
       setAiData(null);
       setAiError(null);
       setHasSearched(true);
+      setAiRefreshNonce((n) => n + 1);
       window.setTimeout(() => {
         resultsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
       }, 100);
     },
-    [selectedBranch, pendingLocation, activeLocation]
+    [
+      selectedBranch,
+      addressInput,
+      allStations,
+      allBranchStations,
+      exactSelectedStation,
+      filters.preferredStationId,
+      pendingLocation,
+      activeLocation,
+      resolveAreaTextToLocation,
+    ]
   );
 
   // Option B: Choose on Map
@@ -365,102 +617,20 @@ const AISmartTransportFinderContent: React.FC = () => {
     );
   };
 
-  // Quick-select Dubai area chip handler (uses Geocoding proxy + Places API (New) fallback)
-  const handleQuickAreaClick = async (area: { label: string; query: string }) => {
-    if (!selectedBranch) {
-      setValidationError('Please select your preferred Eco Drive branch first.');
-      return;
-    }
-    setQuickAreaLoading(area.label);
-    setGeoError(null);
-    setValidationError(null);
-    try {
-      let resolved: { lat: number; lng: number; formattedAddress: string } | null = null;
-
-      try {
-        const resp = await fetch(`/api/maps/geocode?address=${encodeURIComponent(area.query)}`);
-        const data = (await resp.json()) as {
-          quotaExceeded?: boolean;
-          error?: string;
-          result?: { lat: number; lng: number; formattedAddress: string } | null;
-        };
-        if (resp.status === 429 || data.quotaExceeded) {
-          window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
-          setGeoError('Geocoding limit reached. Please select your area on the map.');
-          return;
-        }
-        if (resp.ok && data.result) {
-          resolved = data.result;
-        }
-      } catch {
-        // Fall through to client Places API (New) searchByText
-      }
-
-      if (!resolved && placesLib?.Place?.searchByText) {
-        try {
-          const { places } = await placesLib.Place.searchByText({
-            textQuery: area.query,
-            fields: ['displayName', 'formattedAddress', 'location'],
-            locationBias: DUBAI_QUICK_BOUNDS,
-            region: 'AE',
-            maxResultCount: 1,
-          });
-          const found = places?.[0];
-          if (found?.location) {
-            resolved = {
-              lat: found.location.lat(),
-              lng: found.location.lng(),
-              formattedAddress: found.formattedAddress || found.displayName || area.label,
-            };
-          }
-        } catch (placesErr: unknown) {
-          const msg = String(placesErr instanceof Error ? placesErr.message : placesErr || '');
-          if (
-            msg.includes('RESOURCE_EXHAUSTED') ||
-            msg.includes('OVER_QUERY_LIMIT') ||
-            msg.includes('429')
-          ) {
-            window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
-          }
-        }
-      }
-
-      if (!resolved) {
-        setGeoError(
-          `Could not look up "${area.label}". Try typing in the address search or clicking "Choose on Map".`
-        );
-        return;
-      }
-
-      const loc: StudentLocation = {
-        lat: resolved.lat,
-        lng: resolved.lng,
-        label: resolved.formattedAddress,
-        areaName: area.label,
-        source: 'quick-area',
-      };
-      setAddressInput(resolved.formattedAddress);
-      setPendingLocation(loc);
-      if (hasSearched) {
-        setActiveLocation(loc);
-        setOverrideStationId(null);
-      }
-    } catch {
-      setGeoError('Unable to reach location lookup service. Please pick your location directly on the map.');
-    } finally {
-      setQuickAreaLoading(null);
-    }
-  };
-
   // Reset refinement filters while keeping selected branch active
   const handleResetFilters = () => {
     setFilters(DEFAULT_FILTERS);
     setOverrideStationId(null);
+    if (activeMatchType === 'exact_station' && !activeLocation) {
+      setExactStationId(null);
+      setHasSearched(false);
+    }
   };
 
   // Fetch AI Recommendations strictly for the selected branch & verified result
   useEffect(() => {
-    if (!selectedBranch || !hasSearched || !activeLocation || pinsLoading) return;
+    if (!selectedBranch || !hasSearched || pinsLoading) return;
+    if (!activeLocation && !exactSelectedStation) return;
     if (walkingRouteInfo.status === 'loading') return;
 
     const controller = new AbortController();
@@ -471,10 +641,12 @@ const AISmartTransportFinderContent: React.FC = () => {
       const branchMeta = BRANCH_META[selectedBranch];
       const payload = {
         studentLocation: {
-          label: activeLocation.label,
-          lat: activeLocation.lat,
-          lng: activeLocation.lng,
+          label: activeLocation?.label || exactSelectedStation?.name || 'Official Station Selection',
+          lat: activeLocation?.lat ?? exactSelectedStation?.coordinates?.lat ?? null,
+          lng: activeLocation?.lng ?? exactSelectedStation?.coordinates?.lng ?? null,
         },
+        matchStatus: isViewingExactStation ? ('exact_station' as const) : ('area_no_exact_station' as const),
+        selectedStationName: isViewingExactStation ? exactSelectedStation?.name : undefined,
         dubaiTime: {
           weekday: dubaiNow.weekday,
           formattedTime: dubaiNow.formattedTime,
@@ -484,7 +656,10 @@ const AISmartTransportFinderContent: React.FC = () => {
           ? {
               name: primaryResult.station.name,
               landmarks: primaryResult.station.landmarks,
-              straightLineKm: Number(primaryResult.straightLineKm.toFixed(2)),
+              hasCoordinates: primaryResult.station.hasCoordinates,
+              straightLineKm: primaryResult.station.coordinates
+                ? Number(primaryResult.straightLineKm.toFixed(2))
+                : null,
               walkingDistanceMeters:
                 walkingRouteInfo.status === 'available'
                   ? walkingRouteInfo.distanceMeters ?? null
@@ -515,10 +690,20 @@ const AISmartTransportFinderContent: React.FC = () => {
               })),
             }
           : null,
+        sameRouteStations: sameRouteLines.map((line) => ({
+          routeCode: line.routeCode,
+          routeTitle: line.routeTitle,
+          stops: line.stops.map((st) => ({
+            name: st.name,
+            isCurrent: st.isCurrent,
+            landmark: st.landmark,
+          })),
+        })),
         nearbyAlternatives: otherNearbyResults.map((alt) => {
           const altNext = computeNextBus(alt.filteredDepartures, filters.operatingDay, dubaiNow);
           return {
             name: alt.station.name,
+            relationship: 'optional_nearby_alternative',
             straightLineKm: Number(alt.straightLineKm.toFixed(2)),
             branchesServed: [branchMeta.title],
             nextDepartureTime: altNext?.departure.pickupTime ?? null,
@@ -540,11 +725,24 @@ const AISmartTransportFinderContent: React.FC = () => {
         signal: controller.signal,
       })
         .then(async (resp) => {
-          const data = await resp.json();
-          if (!resp.ok) {
-            throw new Error(data.error || 'Unable to generate AI recommendations.');
+          const rawText = await resp.text();
+          let data: Record<string, unknown> = {};
+          try {
+            data = rawText ? (JSON.parse(rawText) as Record<string, unknown>) : {};
+          } catch {
+            if (!resp.ok) {
+              throw new Error(`AI service returned HTTP ${resp.status}. Please try again.`);
+            }
+            throw new Error('Invalid response received from AI recommendation service.');
           }
-          setAiData(data as AIRecommendationResponse);
+          if (!resp.ok) {
+            throw new Error(
+              typeof data.error === 'string' && data.error
+                ? data.error
+                : 'Unable to generate AI recommendations.'
+            );
+          }
+          setAiData(data as unknown as AIRecommendationResponse);
         })
         .catch((err: unknown) => {
           if (err instanceof DOMException && err.name === 'AbortError') return;
@@ -566,6 +764,9 @@ const AISmartTransportFinderContent: React.FC = () => {
     selectedBranch,
     hasSearched,
     activeLocation,
+    exactSelectedStation,
+    isViewingExactStation,
+    sameRouteLines,
     pinsLoading,
     walkingRouteInfo.status,
     walkingRouteInfo.distanceMeters,
@@ -577,13 +778,14 @@ const AISmartTransportFinderContent: React.FC = () => {
     filters.maxDistanceKm,
     effectiveWeekday,
     unmappedStations.length,
+    aiRefreshNonce,
   ]);
 
   const handleWalkingRouteUpdate = useCallback((info: WalkingRouteInfo) => {
     setWalkingRouteInfo(info);
   }, []);
 
-  const hasLocationSelected = Boolean(pendingLocation || activeLocation);
+  const hasLocationSelected = Boolean(pendingLocation || activeLocation || exactSelectedStation);
   const currentStep = !selectedBranch
     ? 1
     : !hasLocationSelected
@@ -591,12 +793,6 @@ const AISmartTransportFinderContent: React.FC = () => {
       : !hasSearched
         ? 3
         : 4;
-
-  const hasActiveRefinements =
-    filters.preferredStationId !== 'all' ||
-    filters.timePeriod !== 'all' ||
-    filters.operatingDay !== 'today' ||
-    filters.maxDistanceKm !== null;
 
   const selectedBranchMeta = selectedBranch ? BRANCH_META[selectedBranch] : null;
 
@@ -855,80 +1051,72 @@ const AISmartTransportFinderContent: React.FC = () => {
 
         {/* Location Options (unlocked once Step 1 Branch is chosen) */}
         {selectedBranch ? (
-          <div className="space-y-4">
-            <div className="space-y-3">
-              <label className="block text-xs font-bold text-[#0F172A] dark:text-slate-200">
-                A. Enter Residential Address (or Choose on Map / Current Location)
-              </label>
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 items-start">
-                <div className="lg:col-span-7">
-                  <AddressAutocompleteInput
-                    value={addressInput}
-                    onChange={(val) => {
-                      setAddressInput(val);
-                      setGeoError(null);
-                      setValidationError(null);
-                    }}
-                    onSelectLocation={(loc) => {
-                      setPendingLocation(loc);
-                      setGeoError(null);
-                      setValidationError(null);
-                      if (hasSearched) {
-                        setActiveLocation(loc);
-                        setOverrideStationId(null);
-                      }
-                    }}
-                    placeholder="Enter your residential area, building, street, or landmark in Dubai..."
-                    autoTriggerFindOnSelect={false}
-                  />
-                </div>
-
-                <div className="lg:col-span-5 flex flex-wrap sm:flex-nowrap items-center gap-2.5">
-                  <button
-                    type="button"
-                    onClick={handleOpenMapPicker}
-                    className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-[#F0FDF4] dark:bg-emerald-950/60 hover:bg-[#D1FAE5] dark:hover:bg-emerald-900/60 text-[#006B45] dark:text-emerald-300 border border-[#D1FAE5] dark:border-emerald-800/70 text-xs font-bold transition-colors whitespace-nowrap"
-                  >
-                    <MapIcon className="w-4 h-4 shrink-0" />
-                    <span>Choose on Map</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={handleUseCurrentLocation}
-                    disabled={geoLoading}
-                    className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-[#0F172A] dark:text-slate-100 border border-[#CBD5E1] dark:border-slate-700 text-xs font-bold transition-colors whitespace-nowrap disabled:opacity-60"
-                  >
-                    {geoLoading ? (
-                      <Loader2 className="w-4 h-4 animate-spin text-[#006B45] dark:text-emerald-400 shrink-0" />
-                    ) : (
-                      <LocateFixed className="w-4 h-4 text-[#006B45] dark:text-emerald-400 shrink-0" />
-                    )}
-                    <span>{geoLoading ? 'Locating...' : 'Use My Current Location'}</span>
-                  </button>
-                </div>
+          <div className="space-y-3">
+            <label className="block text-xs font-bold text-[#0F172A] dark:text-slate-200">
+              Enter Residential Address (or Choose on Map / Current Location)
+            </label>
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 items-start">
+              <div className="lg:col-span-7">
+                <AddressAutocompleteInput
+                  value={addressInput}
+                  onChange={(val) => {
+                    setAddressInput(val);
+                    setPendingLocation(null);
+                    setExactStationId(null);
+                    setGeoError(null);
+                    setValidationError(null);
+                  }}
+                  onSelectLocation={(loc) => {
+                    const matched = matchOfficialStationQuery(
+                      loc.areaName || loc.label,
+                      allStations,
+                      selectedBranch
+                    );
+                    setPendingLocation(loc);
+                    if (matched) {
+                      setExactStationId(matched.id);
+                      setActiveMatchType('exact_station');
+                      setFilters((f) => ({ ...f, preferredStationId: matched.id }));
+                    } else {
+                      setExactStationId(null);
+                      setActiveMatchType('area_no_exact_station');
+                      setFilters((f) => ({ ...f, preferredStationId: 'all' }));
+                    }
+                    setGeoError(null);
+                    setValidationError(null);
+                    if (hasSearched) {
+                      setActiveLocation(loc);
+                      setOverrideStationId(null);
+                    }
+                  }}
+                  placeholder="Enter your residential area, landmark, or station name (e.g. Al Rigga, Union, Burjuman)..."
+                  autoTriggerFindOnSelect={false}
+                />
               </div>
 
-              {/* Popular Dubai Area Quick Selectors */}
-              <div className="flex flex-wrap items-center gap-1.5 pt-1">
-                <span className="text-[11px] font-semibold text-[#64748B] dark:text-slate-400 mr-1">
-                  Popular Dubai areas:
-                </span>
-                {QUICK_DUBAI_AREAS.map((area) => {
-                  const isBusy = quickAreaLoading === area.label;
-                  return (
-                    <button
-                      key={area.label}
-                      type="button"
-                      disabled={quickAreaLoading !== null}
-                      onClick={() => void handleQuickAreaClick(area)}
-                      className="px-2.5 py-1 rounded-lg bg-[#F8FAFC] dark:bg-slate-900 hover:bg-[#F0FDF4] dark:hover:bg-emerald-950/60 hover:text-[#006B45] dark:hover:text-emerald-300 border border-[#E2E8F0] dark:border-slate-700 hover:border-[#D1FAE5] dark:hover:border-emerald-800 text-[11px] font-medium text-[#475569] dark:text-slate-300 transition-colors inline-flex items-center gap-1 disabled:opacity-60"
-                    >
-                      {isBusy && <Loader2 className="w-3 h-3 animate-spin" />}
-                      <span>{area.label}</span>
-                    </button>
-                  );
-                })}
+              <div className="lg:col-span-5 flex flex-wrap sm:flex-nowrap items-center gap-2.5">
+                <button
+                  type="button"
+                  onClick={handleOpenMapPicker}
+                  className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-[#F0FDF4] dark:bg-emerald-950/60 hover:bg-[#D1FAE5] dark:hover:bg-emerald-900/60 text-[#006B45] dark:text-emerald-300 border border-[#D1FAE5] dark:border-emerald-800/70 text-xs font-bold transition-colors whitespace-nowrap"
+                >
+                  <MapIcon className="w-4 h-4 shrink-0" />
+                  <span>Choose on Map</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleUseCurrentLocation}
+                  disabled={geoLoading}
+                  className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-[#0F172A] dark:text-slate-100 border border-[#CBD5E1] dark:border-slate-700 text-xs font-bold transition-colors whitespace-nowrap disabled:opacity-60"
+                >
+                  {geoLoading ? (
+                    <Loader2 className="w-4 h-4 animate-spin text-[#006B45] dark:text-emerald-400 shrink-0" />
+                  ) : (
+                    <LocateFixed className="w-4 h-4 text-[#006B45] dark:text-emerald-400 shrink-0" />
+                  )}
+                  <span>{geoLoading ? 'Locating...' : 'Use My Current Location'}</span>
+                </button>
               </div>
             </div>
           </div>
@@ -952,6 +1140,22 @@ const AISmartTransportFinderContent: React.FC = () => {
                   Step 1 required: Choose your destination Eco Drive branch above.
                 </span>
               </>
+            ) : exactSelectedStation ? (
+              <>
+                <CheckCircle2 className="w-4 h-4 text-[#059669] dark:text-emerald-400 shrink-0" />
+                <div className="min-w-0">
+                  <span className="text-[#64748B] dark:text-slate-400 font-medium">Selected Exact Station: </span>
+                  <span className="font-bold text-[#0F172A] dark:text-slate-100 break-words">
+                    {exactSelectedStation.name}
+                  </span>
+                  {exactSelectedStation.coordinates && (
+                    <span className="ml-2 font-mono text-[11px] text-[#64748B] dark:text-slate-400">
+                      ({exactSelectedStation.coordinates.lat.toFixed(5)},{' '}
+                      {exactSelectedStation.coordinates.lng.toFixed(5)})
+                    </span>
+                  )}
+                </div>
+              </>
             ) : pendingLocation || activeLocation ? (
               <>
                 <CheckCircle2 className="w-4 h-4 text-[#059669] dark:text-emerald-400 shrink-0" />
@@ -970,7 +1174,7 @@ const AISmartTransportFinderContent: React.FC = () => {
               <>
                 <Info className="w-4 h-4 text-[#64748B] dark:text-slate-400 shrink-0" />
                 <span className="text-[#64748B] dark:text-slate-400">
-                  Enter your Dubai residential address, choose on the map, or use current location.
+                  Enter your Dubai residential address, pick on the map, or select an exact official Eco Drive station.
                 </span>
               </>
             )}
@@ -978,16 +1182,24 @@ const AISmartTransportFinderContent: React.FC = () => {
 
           <button
             type="button"
-            onClick={() => runBranchValidatedSearch()}
-            disabled={pinsLoading}
+            onClick={() => void runBranchValidatedSearch()}
+            disabled={pinsLoading || searchBusy}
             className="inline-flex items-center justify-center gap-2 px-6 py-3 rounded-xl bg-[#006B45] hover:bg-[#064E3B] disabled:opacity-60 text-white text-xs sm:text-sm font-extrabold shadow-sm transition-all shrink-0"
           >
-            {pinsLoading ? (
+            {pinsLoading || searchBusy ? (
               <Loader2 className="w-4 h-4 animate-spin" />
             ) : (
               <Navigation className="w-4 h-4" />
             )}
-            <span>{pinsLoading ? 'Loading Official Stations...' : 'Find My Nearest Bus Stop'}</span>
+            <span>
+              {pinsLoading
+                ? 'Loading Official Stations...'
+                : searchBusy
+                  ? 'Resolving Location...'
+                  : exactSelectedStation
+                    ? 'Show Exact Station Schedule'
+                    : 'Find My Nearest Bus Stop'}
+            </span>
           </button>
         </div>
 
@@ -1012,141 +1224,11 @@ const AISmartTransportFinderContent: React.FC = () => {
       </section>
 
       {/* =================================================================== */}
-      {/* REFINEMENT FILTERS (Strictly Branch-Locked)                         */}
-      {/* =================================================================== */}
-      {selectedBranch && selectedBranchMeta && (
-        <section className="bg-white dark:bg-[#0F172A] rounded-2xl border border-[#E2E8F0] dark:border-slate-800 p-4 sm:p-5 shadow-xs space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#E2E8F0] dark:border-slate-800 pb-3">
-            <div className="flex items-center gap-2">
-              <div className="w-7 h-7 rounded-lg bg-[#F0FDF4] dark:bg-emerald-950/60 text-[#006B45] dark:text-emerald-400 border border-[#D1FAE5] dark:border-emerald-800/70 flex items-center justify-center">
-                <SlidersHorizontal className="w-4 h-4" />
-              </div>
-              <div>
-                <h3 className="text-sm font-bold text-[#0F172A] dark:text-slate-100">
-                  Schedule & Distance Filters ({selectedBranchMeta.shortName})
-                </h3>
-                <p className="text-[11px] text-[#64748B] dark:text-slate-400">
-                  Showing only stations and timetables belonging to {selectedBranchMeta.title}.
-                </p>
-              </div>
-            </div>
-
-            {hasActiveRefinements && (
-              <button
-                type="button"
-                onClick={handleResetFilters}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-[#0F172A] dark:text-slate-100 transition-colors"
-              >
-                <RotateCcw className="w-3.5 h-3.5 text-[#006B45] dark:text-emerald-400" />
-                <span>Reset Filters</span>
-              </button>
-            )}
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-            {/* Filter 1: Preferred Pickup Station (strictly within selectedBranch) */}
-            <div>
-              <label className="block text-[11px] font-bold text-[#475569] dark:text-slate-300 mb-1">
-                {selectedBranchMeta.shortName} Pickup Station
-              </label>
-              <select
-                value={filters.preferredStationId}
-                onChange={(e) => {
-                  setFilters((f) => ({ ...f, preferredStationId: e.target.value }));
-                  setOverrideStationId(null);
-                }}
-                className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-900 border border-[#CBD5E1] dark:border-slate-700 rounded-xl text-[#0F172A] dark:text-slate-100 focus:bg-white dark:focus:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-[#006B45]"
-              >
-                <option value="all">
-                  Any {selectedBranchMeta.shortName} Station ({branchMappedStations.length} GPS Stops)
-                </option>
-                {branchMappedStations
-                  .slice()
-                  .sort((a, b) => a.name.localeCompare(b.name))
-                  .map((st) => (
-                    <option key={st.id} value={st.id}>
-                      {st.name}
-                    </option>
-                  ))}
-              </select>
-            </div>
-
-            {/* Filter 2: Preferred Departure Time */}
-            <div>
-              <label className="block text-[11px] font-bold text-[#475569] dark:text-slate-300 mb-1">
-                Preferred Departure Time
-              </label>
-              <select
-                value={filters.timePeriod}
-                onChange={(e) =>
-                  setFilters((f) => ({
-                    ...f,
-                    timePeriod: e.target.value as TimeFilterOption,
-                  }))
-                }
-                className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-900 border border-[#CBD5E1] dark:border-slate-700 rounded-xl text-[#0F172A] dark:text-slate-100 focus:bg-white dark:focus:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-[#006B45]"
-              >
-                <option value="all">All Times (Morning – Evening)</option>
-                <option value="morning">Morning (Before 12:00 PM)</option>
-                <option value="afternoon">Afternoon (12:00 PM – 4:59 PM)</option>
-                <option value="evening">Evening (5:00 PM Onwards)</option>
-              </select>
-            </div>
-
-            {/* Filter 3: Operating Day */}
-            <div>
-              <label className="block text-[11px] font-bold text-[#475569] dark:text-slate-300 mb-1">
-                Day of Operation
-              </label>
-              <select
-                value={filters.operatingDay}
-                onChange={(e) =>
-                  setFilters((f) => ({
-                    ...f,
-                    operatingDay: e.target.value as OperatingDayOption,
-                  }))
-                }
-                className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-900 border border-[#CBD5E1] dark:border-slate-700 rounded-xl text-[#0F172A] dark:text-slate-100 focus:bg-white dark:focus:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-[#006B45]"
-              >
-                {OPERATING_DAYS.map((d) => (
-                  <option key={d.value} value={d.value}>
-                    {d.label}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            {/* Filter 4: Maximum Straight-Line Distance */}
-            <div>
-              <label className="block text-[11px] font-bold text-[#475569] dark:text-slate-300 mb-1">
-                Maximum Straight-Line Distance
-              </label>
-              <select
-                value={filters.maxDistanceKm === null ? 'any' : String(filters.maxDistanceKm)}
-                onChange={(e) =>
-                  setFilters((f) => ({
-                    ...f,
-                    maxDistanceKm: e.target.value === 'any' ? null : Number(e.target.value),
-                  }))
-                }
-                className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-900 border border-[#CBD5E1] dark:border-slate-700 rounded-xl text-[#0F172A] dark:text-slate-100 focus:bg-white dark:focus:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-[#006B45]"
-              >
-                <option value="any">Any Distance</option>
-                <option value="2">Within 2 km</option>
-                <option value="5">Within 5 km</option>
-                <option value="10">Within 10 km</option>
-                <option value="20">Within 20 km</option>
-              </select>
-            </div>
-          </div>
-        </section>
-      )}
-
-      {/* =================================================================== */}
       {/* STEP 4: BRANCH-SPECIFIC SEARCH RESULTS                              */}
       {/* =================================================================== */}
-      {selectedBranch && selectedBranchMeta && hasSearched && activeLocation && (
+      {selectedBranch && selectedBranchMeta && hasSearched && (activeLocation || exactSelectedStation) && (
         <div ref={resultsSectionRef} className="space-y-6">
+
           {!primaryResult ? (
             <div className="bg-white dark:bg-[#0F172A] rounded-2xl border border-[#E2E8F0] dark:border-slate-800 p-10 text-center shadow-xs">
               <Compass className="w-12 h-12 text-[#94A3B8] dark:text-slate-500 mx-auto mb-3" />
@@ -1154,7 +1236,7 @@ const AISmartTransportFinderContent: React.FC = () => {
                 No Matching {selectedBranchMeta.shortName} Bus Stations Found Within Current Filters
               </h3>
               <p className="text-xs text-[#64748B] dark:text-slate-400 max-w-lg mx-auto mt-1">
-                No verified {selectedBranchMeta.title} pickup stop matched your active distance or time filters. Reset the filters to view the closest available {selectedBranchMeta.shortName} station.
+                No verified {selectedBranchMeta.title} pickup stop matched your active distance or time filters. Reset the filters to view available {selectedBranchMeta.shortName} stations.
               </p>
               <button
                 type="button"
@@ -1167,18 +1249,20 @@ const AISmartTransportFinderContent: React.FC = () => {
             </div>
           ) : (
             <>
-              {/* Top 2-Column Highlight: Recommended Station Card + Next Available Bus */}
+              {/* Top 2-Column Highlight: Primary Station Card + Next Available Bus */}
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
-                {/* Card A: Your Recommended Bus Station */}
+                {/* Card A: Exact Selected Station OR Closest Optional Nearby Alternative */}
                 <div className="lg:col-span-7 bg-white dark:bg-[#0F172A] rounded-2xl border border-[#006B45]/30 dark:border-emerald-800/70 shadow-sm overflow-hidden flex flex-col">
                   <div className="bg-gradient-to-r from-[#064E3B] to-[#006B45] text-white p-5">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-400/20 text-emerald-100 border border-emerald-300/30 text-[11px] font-bold uppercase tracking-wider">
                         <Bus className="w-3.5 h-3.5 text-emerald-300" />
                         <span>
-                          {closestOverallResult?.station.id === primaryResult.station.id
-                            ? 'Your Recommended Bus Station'
-                            : 'Selected Alternative Station'}
+                          {isViewingExactStation
+                            ? 'Exact Selected Station'
+                            : overrideStationId
+                              ? 'Optional Nearby Alternative (Selected)'
+                              : 'Optional Nearby Alternative'}
                         </span>
                       </span>
                       <span className="px-2.5 py-0.5 rounded-full bg-white/15 text-white text-[11px] font-bold border border-white/20">
@@ -1192,10 +1276,14 @@ const AISmartTransportFinderContent: React.FC = () => {
                     <p className="text-xs sm:text-sm text-emerald-100/90 mt-1">
                       {primaryResult.station.landmarks.join(' · ')}
                     </p>
-                    {primaryResult.station.coordinates && (
+                    {primaryResult.station.coordinates ? (
                       <p className="text-[11px] font-mono text-emerald-200/80 mt-1">
                         Station Coordinates: {primaryResult.station.coordinates.lat.toFixed(5)},{' '}
                         {primaryResult.station.coordinates.lng.toFixed(5)}
+                      </p>
+                    ) : (
+                      <p className="text-[11px] text-amber-200 mt-1">
+                        GPS Pin Coordinates: Not listed in official schedule (timetable-verified stop)
                       </p>
                     )}
                   </div>
@@ -1209,10 +1297,18 @@ const AISmartTransportFinderContent: React.FC = () => {
                           <span>Straight-Line Distance</span>
                         </span>
                         <span className="block font-mono text-base font-extrabold text-[#0F172A] dark:text-slate-100 mt-1">
-                          {formatStraightLineDistance(primaryResult.straightLineKm)}
+                          {primaryResult.station.coordinates && activeLocation
+                            ? isViewingExactStation &&
+                              activeLocation.areaName?.toLowerCase() ===
+                                primaryResult.station.name.toLowerCase()
+                              ? '0 m (At Station)'
+                              : formatStraightLineDistance(primaryResult.straightLineKm)
+                            : 'Unavailable'}
                         </span>
                         <span className="block text-[10px] text-[#64748B] dark:text-slate-400">
-                          Geographic gap to stop
+                          {primaryResult.station.coordinates
+                            ? 'Geographic gap to stop'
+                            : 'No station GPS pin'}
                         </span>
                       </div>
 
@@ -1436,75 +1532,107 @@ const AISmartTransportFinderContent: React.FC = () => {
                   </div>
                 </div>
               </div>
-
-              {/* AI-POWERED RECOMMENDATIONS */}
-              <section className="bg-gradient-to-br from-[#F0FDF4] to-white dark:from-emerald-950/40 dark:to-[#0F172A] rounded-2xl border border-[#D1FAE5] dark:border-emerald-800/70 p-5 shadow-xs space-y-3">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="flex items-center gap-2.5">
-                    <div className="w-8 h-8 rounded-xl bg-[#064E3B] text-emerald-300 flex items-center justify-center shrink-0">
-                      <Sparkles className="w-4 h-4" />
-                    </div>
-                    <div>
-                      <h3 className="text-sm sm:text-base font-extrabold text-[#064E3B] dark:text-emerald-200">
-                        AI Transportation Assistant ({selectedBranchMeta.shortName})
-                      </h3>
-                      <p className="text-[11px] text-[#006B45] dark:text-emerald-400">
-                        Verified guidance strictly for {selectedBranchMeta.title} stations and schedules
-                      </p>
-                    </div>
-                  </div>
-                </div>
-
-                {aiLoading ? (
-                  <div className="flex items-center gap-2.5 text-xs text-[#064E3B] dark:text-emerald-300 py-3">
-                    <Loader2 className="w-4 h-4 animate-spin text-[#006B45] dark:text-emerald-400" />
-                    <span>
-                      Analyzing nearest {selectedBranchMeta.shortName} stations, walking distance, and live departure times...
-                    </span>
-                  </div>
-                ) : aiError ? (
-                  <div className="bg-white/80 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/70 rounded-xl p-3.5 text-xs text-amber-900 dark:text-amber-200 flex items-start gap-2">
-                    <AlertCircle className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
-                    <div>
-                      <span className="font-bold block">AI Summary Unavailable</span>
-                      <span>{aiError}</span>
-                    </div>
-                  </div>
-                ) : aiData ? (
-                  <div className="space-y-3">
-                    <p className="text-xs sm:text-sm font-bold text-[#0F172A] dark:text-slate-100">
-                      {aiData.headline}
-                    </p>
-                    <ul className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                      {aiData.recommendations.map((rec, idx) => (
-                        <li
-                          key={idx}
-                          className="bg-white dark:bg-slate-900 border border-[#D1FAE5] dark:border-emerald-800/70 rounded-xl p-3 text-xs text-[#0F172A] dark:text-slate-100 flex items-start gap-2"
-                        >
-                          <CheckCircle2 className="w-4 h-4 text-[#059669] dark:text-emerald-400 shrink-0 mt-0.5" />
-                          <span>{rec}</span>
-                        </li>
-                      ))}
-                    </ul>
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 text-xs">
-                      <div className="bg-white/90 dark:bg-slate-900/90 border border-[#E2E8F0] dark:border-slate-800 rounded-xl p-3 text-[#475569] dark:text-slate-300">
-                        <strong className="text-[#064E3B] dark:text-emerald-300 block mb-0.5">
-                          Nearby {selectedBranchMeta.shortName} Alternative Insight:
-                        </strong>
-                        <span>{aiData.alternativeTip}</span>
-                      </div>
-                      <div className="bg-white/90 dark:bg-slate-900/90 border border-[#E2E8F0] dark:border-slate-800 rounded-xl p-3 text-[#475569] dark:text-slate-300">
-                        <strong className="text-[#064E3B] dark:text-emerald-300 block mb-0.5">
-                          Boarding Reminder:
-                        </strong>
-                        <span>{aiData.arrivalReminder}</span>
-                      </div>
-                    </div>
-                  </div>
-                ) : null}
-              </section>
             </>
           )}
+
+          {/* AI-POWERED RECOMMENDATIONS (Always visible after search, including empty filter states) */}
+          <section className="bg-gradient-to-br from-[#F0FDF4] to-white dark:from-emerald-950/40 dark:to-[#0F172A] rounded-2xl border border-[#D1FAE5] dark:border-emerald-800/70 p-5 shadow-xs space-y-3.5">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-xl bg-[#064E3B] text-emerald-300 flex items-center justify-center shrink-0">
+                  <Sparkles className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm sm:text-base font-extrabold text-[#064E3B] dark:text-emerald-200">
+                    AI Transportation Assistant ({selectedBranchMeta.shortName})
+                  </h3>
+                  <p className="text-[11px] text-[#006B45] dark:text-emerald-400">
+                    Verified guidance strictly for {selectedBranchMeta.title} stations and schedules
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 self-start sm:self-auto">
+                <button
+                  type="button"
+                  disabled={aiLoading}
+                  onClick={() => {
+                    setAiRefreshNonce((n) => n + 1);
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white dark:bg-slate-800 hover:bg-[#F0FDF4] dark:hover:bg-slate-700 text-[#006B45] dark:text-emerald-300 border border-[#D1FAE5] dark:border-slate-700 text-xs font-bold transition-colors disabled:opacity-60"
+                >
+                  {aiLoading ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <RotateCcw className="w-3.5 h-3.5" />
+                  )}
+                  <span>{aiLoading ? 'Analyzing...' : 'Refresh AI'}</span>
+                </button>
+              </div>
+            </div>
+
+            {aiLoading ? (
+              <div className="flex items-center gap-2.5 text-xs text-[#064E3B] dark:text-emerald-300 py-3">
+                <Loader2 className="w-4 h-4 animate-spin text-[#006B45] dark:text-emerald-400 shrink-0" />
+                <span>
+                  Analyzing nearest {selectedBranchMeta.shortName} stations, walking distance, and live departure times...
+                </span>
+              </div>
+            ) : aiError ? (
+              <div className="bg-white/90 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/70 rounded-xl p-3.5 text-xs text-amber-900 dark:text-amber-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-bold block">AI Recommendations Unavailable</span>
+                    <span>{aiError}</span>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setAiRefreshNonce((n) => n + 1)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold shrink-0 self-start sm:self-center transition-colors"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Retry AI</span>
+                </button>
+              </div>
+            ) : aiData ? (
+              <div className="space-y-3">
+                <p className="text-xs sm:text-sm font-bold text-[#0F172A] dark:text-slate-100">
+                  {aiData.headline}
+                </p>
+                <ul className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                  {aiData.recommendations.map((rec, idx) => (
+                    <li
+                      key={idx}
+                      className="bg-white dark:bg-slate-900 border border-[#D1FAE5] dark:border-emerald-800/70 rounded-xl p-3 text-xs text-[#0F172A] dark:text-slate-100 flex items-start gap-2"
+                    >
+                      <CheckCircle2 className="w-4 h-4 text-[#059669] dark:text-emerald-400 shrink-0 mt-0.5" />
+                      <span>{rec}</span>
+                    </li>
+                  ))}
+                </ul>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 text-xs">
+                  <div className="bg-white/90 dark:bg-slate-900/90 border border-[#E2E8F0] dark:border-slate-800 rounded-xl p-3 text-[#475569] dark:text-slate-300">
+                    <strong className="text-[#064E3B] dark:text-emerald-300 block mb-0.5">
+                      Nearby {selectedBranchMeta.shortName} Alternative Insight:
+                    </strong>
+                    <span>{aiData.alternativeTip}</span>
+                  </div>
+                  <div className="bg-white/90 dark:bg-slate-900/90 border border-[#E2E8F0] dark:border-slate-800 rounded-xl p-3 text-[#475569] dark:text-slate-300">
+                    <strong className="text-[#064E3B] dark:text-emerald-300 block mb-0.5">
+                      Boarding Reminder:
+                    </strong>
+                    <span>{aiData.arrivalReminder}</span>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="bg-white/80 dark:bg-slate-900/70 border border-[#D1FAE5] dark:border-emerald-800/50 rounded-xl p-3.5 text-xs text-[#475569] dark:text-slate-300 flex items-center justify-between gap-3">
+                <span>Click &ldquo;Refresh AI&rdquo; to generate personalized transportation guidance for your selected stop.</span>
+              </div>
+            )}
+          </section>
         </div>
       )}
 
@@ -1516,8 +1644,10 @@ const AISmartTransportFinderContent: React.FC = () => {
           <SmartTransportMap
             studentLocation={hasSearched ? activeLocation : pendingLocation}
             allMappedStations={branchMappedStations}
-            nearestStation={hasSearched ? primaryResult : null}
-            selectedStationId={overrideStationId}
+            nearestStation={
+              hasSearched && primaryResult?.station.hasCoordinates ? primaryResult : null
+            }
+            selectedStationId={overrideStationId || exactStationId}
             focusStationTrigger={focusStationTrigger}
             schoolCenters={schoolCenters}
             isPickerMode={isPickerMode}
@@ -1525,6 +1655,9 @@ const AISmartTransportFinderContent: React.FC = () => {
             onConfirmPickedLocation={(loc) => {
               setAddressInput(loc.label);
               setPendingLocation(loc);
+              setExactStationId(null);
+              setActiveMatchType('area_no_exact_station');
+              setFilters((f) => ({ ...f, preferredStationId: 'all' }));
               setValidationError(null);
               if (hasSearched) {
                 setActiveLocation(loc);
@@ -1532,8 +1665,9 @@ const AISmartTransportFinderContent: React.FC = () => {
               }
             }}
             onSelectStationFromMap={(stationId) => {
-              if (hasSearched && activeLocation) {
-                setOverrideStationId(stationId);
+              const st = allBranchStations.find((s) => s.id === stationId);
+              if (st) {
+                handleSelectDirectOfficialStation(st, true);
               }
             }}
             onWalkingRouteUpdate={handleWalkingRouteUpdate}
@@ -1685,26 +1819,127 @@ const AISmartTransportFinderContent: React.FC = () => {
       )}
 
       {/* =================================================================== */}
-      {/* ALTERNATIVE NEARBY STATIONS (Top 3 Closest for Selected Branch)     */}
+      {/* STATIONS ON THE SAME ROUTE / TRANSPORTATION LINE                    */}
+      {/* =================================================================== */}
+      {selectedBranch && selectedBranchMeta && hasSearched && primaryResult && sameRouteLines.length > 0 && (
+        <section className="bg-white dark:bg-[#0F172A] rounded-2xl border border-[#E2E8F0] dark:border-slate-800 p-4 sm:p-5 shadow-xs space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-[#E2E8F0] dark:border-slate-800 pb-3">
+            <div className="flex items-start gap-2.5">
+              <div className="w-8 h-8 rounded-xl bg-[#F0FDF4] dark:bg-emerald-950/60 text-[#006B45] dark:text-emerald-400 border border-[#D1FAE5] dark:border-emerald-800/70 flex items-center justify-center shrink-0">
+                <GitBranch className="w-4 h-4" />
+              </div>
+              <div>
+                <h3 className="text-sm sm:text-base font-extrabold text-[#0F172A] dark:text-slate-100">
+                  Stations on the Same Route / Transportation Line ({selectedBranchMeta.shortName})
+                </h3>
+                <p className="text-xs text-[#64748B] dark:text-slate-400">
+                  Official stop sequence on the bus line(s) serving{' '}
+                  <strong className="text-[#0F172A] dark:text-slate-200">{primaryResult.station.name}</strong>.
+                  These are route-line connections, distinct from optional nearby geographic alternatives.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-4">
+            {sameRouteLines.map((line) => (
+              <div
+                key={line.routeId}
+                className="rounded-xl border border-[#E2E8F0] dark:border-slate-800 bg-[#F8FAFC] dark:bg-slate-900/70 p-4 space-y-3"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="px-2.5 py-0.5 rounded-lg bg-[#064E3B] text-white text-[11px] font-bold">
+                      {line.routeCode}
+                    </span>
+                    <span className="text-xs sm:text-sm font-bold text-[#0F172A] dark:text-slate-100">
+                      {line.routeTitle}
+                    </span>
+                  </div>
+                  <span className="text-[11px] font-semibold text-[#006B45] dark:text-emerald-300">
+                    Destination: {line.destinationName} · {line.capacity} Seater
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+                  {line.stops.map((stop, idx) => (
+                    <div
+                      key={`${line.routeId}-${stop.stopId}`}
+                      className={`p-3 rounded-xl border text-xs flex flex-col justify-between gap-2 ${
+                        stop.isCurrent
+                          ? 'bg-[#F0FDF4] dark:bg-emerald-950/60 border-[#006B45] dark:border-emerald-500 ring-1 ring-[#006B45]/20'
+                          : 'bg-white dark:bg-[#0F172A] border-[#E2E8F0] dark:border-slate-800'
+                      }`}
+                    >
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between gap-1">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-[#64748B] dark:text-slate-400">
+                            Stop {idx + 1}
+                          </span>
+                          <span
+                            className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                              stop.isCurrent
+                                ? 'bg-[#006B45] text-white'
+                                : 'bg-slate-100 dark:bg-slate-800 text-[#475569] dark:text-slate-300'
+                            }`}
+                          >
+                            {stop.isCurrent ? 'Selected Stop' : 'Same Route'}
+                          </span>
+                        </div>
+                        <div className="font-extrabold text-[#0F172A] dark:text-slate-100">
+                          {stop.name}
+                        </div>
+                        <div className="text-[11px] text-[#64748B] dark:text-slate-400 line-clamp-2">
+                          {stop.landmark}
+                        </div>
+                      </div>
+
+                      {!stop.isCurrent && stop.stationId && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const matched = allBranchStations.find((s) => s.id === stop.stationId);
+                            if (matched) handleSelectDirectOfficialStation(matched, true);
+                          }}
+                          className="text-left text-[11px] font-bold text-[#006B45] dark:text-emerald-400 hover:underline inline-flex items-center gap-1"
+                        >
+                          <span>Switch to exact station</span>
+                          <ArrowRight className="w-3 h-3" />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {/* =================================================================== */}
+      {/* OPTIONAL NEARBY ALTERNATIVE STATIONS (Top 3 Closest for Branch)     */}
       {/* =================================================================== */}
       {selectedBranch && selectedBranchMeta && hasSearched && otherNearbyResults.length > 0 && (
         <section className="space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
             <div>
               <h3 className="text-base sm:text-lg font-extrabold text-[#0F172A] dark:text-slate-100">
-                Alternative Nearby Stations ({selectedBranchMeta.shortName} Only)
+                Optional Nearby Alternative Stations ({selectedBranchMeta.shortName} Only)
               </h3>
               <p className="text-xs text-[#64748B] dark:text-slate-400">
-                Next closest {selectedBranchMeta.title} pickup stations sorted from nearest to farthest.
+                Optional {selectedBranchMeta.title} stations ordered strictly by straight-line distance from{' '}
+                {activeLocation ? activeLocation.areaName || activeLocation.label : primaryResult?.station.name}.
               </p>
             </div>
-            {overrideStationId && closestOverallResult && (
+            {overrideStationId && (exactSelectedStation || closestOverallResult) && (
               <button
                 type="button"
                 onClick={() => setOverrideStationId(null)}
                 className="text-xs font-bold text-[#006B45] dark:text-emerald-400 hover:underline self-start sm:self-auto"
               >
-                Return to Closest {selectedBranchMeta.shortName} Station ({closestOverallResult.station.name})
+                {exactSelectedStation
+                  ? `Return to Exact Selected Station (${exactSelectedStation.name})`
+                  : `Return to Closest ${selectedBranchMeta.shortName} Alternative (${closestOverallResult?.station.name})`}
               </button>
             )}
           </div>
@@ -1719,17 +1954,23 @@ const AISmartTransportFinderContent: React.FC = () => {
                 >
                   <div className="space-y-2">
                     <div className="flex items-start justify-between gap-2">
+                      <span className="px-2 py-0.5 rounded bg-amber-50 dark:bg-amber-950/60 text-amber-800 dark:text-amber-200 border border-amber-200 dark:border-amber-800/70 text-[10px] font-bold uppercase tracking-wide">
+                        Optional Nearby Alternative
+                      </span>
                       <span className="px-2 py-0.5 rounded bg-[#F0FDF4] dark:bg-emerald-950/60 text-[#006B45] dark:text-emerald-300 border border-[#D1FAE5] dark:border-emerald-800/70 font-mono text-[11px] font-bold">
                         {formatStraightLineDistance(straightLineKm)} straight-line
                       </span>
-                      <span className="text-[11px] font-semibold text-[#64748B] dark:text-slate-400">
+                    </div>
+
+                    <div className="flex items-baseline justify-between gap-2">
+                      <h4 className="text-sm sm:text-base font-extrabold text-[#0F172A] dark:text-slate-100">
+                        {station.name}
+                      </h4>
+                      <span className="text-[11px] font-semibold text-[#64748B] dark:text-slate-400 shrink-0">
                         {filteredDepartures.length} trips
                       </span>
                     </div>
 
-                    <h4 className="text-sm sm:text-base font-extrabold text-[#0F172A] dark:text-slate-100">
-                      {station.name}
-                    </h4>
                     <p className="text-[11px] text-[#64748B] dark:text-slate-400 line-clamp-2">
                       {station.landmarks[0]}
                     </p>
@@ -1772,7 +2013,7 @@ const AISmartTransportFinderContent: React.FC = () => {
                       }}
                       className="flex-1 inline-flex items-center justify-center gap-1 px-3 py-2 rounded-xl bg-[#006B45] hover:bg-[#064E3B] text-white text-xs font-bold transition-colors"
                     >
-                      <span>View Complete Schedule</span>
+                      <span>View Alternative Schedule</span>
                       <ArrowRight className="w-3.5 h-3.5" />
                     </button>
                     <a

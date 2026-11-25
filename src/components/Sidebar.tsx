@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import {
-  SlidersHorizontal,
+  Tag,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
@@ -11,27 +11,27 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { ActiveTab } from './Header';
-import { DataSourceState } from '../types/pricing';
+import { PricesSummaryStats } from './PricesPage';
 
 interface SidebarProps {
   activeTab: ActiveTab;
   setActiveTab: (tab: ActiveTab) => void;
-  dataSource: DataSourceState;
+  pricesStats: PricesSummaryStats;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
   activeTab,
   setActiveTab,
-  dataSource,
+  pricesStats,
 }) => {
   const [isCollapsed, setIsCollapsed] = useState(false);
 
   const navItems = [
     {
-      id: 'filter' as ActiveTab,
-      label: 'Search by Filter',
-      description: 'Category & fee filters',
-      icon: <SlidersHorizontal className="w-4 h-4" />,
+      id: 'prices' as ActiveTab,
+      label: 'Prices',
+      description: 'Excel catalog & tariffs',
+      icon: <Tag className="w-4 h-4" />,
     },
     {
       id: 'transport' as ActiveTab,
@@ -84,7 +84,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 className="h-9 w-auto max-w-[175px] object-contain"
                 onError={(e) => {
                   (e.currentTarget as HTMLImageElement).src =
-                    "https://www.ecodrivedubai.com/wp-content/uploads/2026/01/eco-drive-logo_White-01-768x313.png";
+                    'https://www.ecodrivedubai.com/wp-content/uploads/2026/01/eco-drive-logo_White-01-768x313.png';
                 }}
               />
             </div>
@@ -99,7 +99,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 className="h-full w-auto max-w-none object-left object-cover"
                 onError={(e) => {
                   (e.currentTarget as HTMLImageElement).src =
-                    "https://www.ecodrivedubai.com/wp-content/uploads/2026/01/eco-drive-logo_White-01-768x313.png";
+                    'https://www.ecodrivedubai.com/wp-content/uploads/2026/01/eco-drive-logo_White-01-768x313.png';
                 }}
               />
             </div>
@@ -180,10 +180,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <div className="bg-black/20 rounded-xl p-3 border border-white/5 space-y-1.5">
             <div className="flex items-center gap-1.5 text-xs font-semibold text-emerald-200">
               <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-              <span>Eco Drive Official Rates</span>
+              <span>Prices Database (D1)</span>
             </div>
             <p className="text-[11px] text-emerald-100/60 leading-snug">
-              {dataSource.totalServicesCount} Services · 5 License Categories
+              {pricesStats.totalCount > 0
+                ? `${pricesStats.totalCount} Records · ${pricesStats.categoriesCount} Categories`
+                : 'Awaiting Excel import'}
             </p>
             <div className="pt-1.5 border-t border-white/10 flex items-center justify-between text-[10px] text-emerald-200/50">
               <span>Currency: AED</span>
@@ -191,7 +193,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </div>
           </div>
         ) : (
-          <div className="flex justify-center py-2" title="Eco Drive Official Rates Verified">
+          <div className="flex justify-center py-2" title="Prices Database (D1)">
             <CheckCircle2 className="w-5 h-5 text-emerald-400" />
           </div>
         )}

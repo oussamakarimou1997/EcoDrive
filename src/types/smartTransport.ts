@@ -115,9 +115,57 @@ export interface ResolvedPinsResponse {
   >;
 }
 
+export type StationMatchType = 'exact_station' | 'area_no_exact_station';
+
+export interface SameRouteStopInfo {
+  stopId: string;
+  stationId: string | null;
+  name: string;
+  landmark: string;
+  isCurrent: boolean;
+  hasCoordinates: boolean;
+  sampleTimes: string[];
+}
+
+export interface SameRouteLineInfo {
+  routeId: string;
+  routeCode: string;
+  routeTitle: string;
+  scheduleType: string;
+  capacity: number;
+  destinationName: string;
+  currentStopIndex: number;
+  stops: SameRouteStopInfo[];
+}
+
 export interface AIRecommendationResponse {
   headline: string;
   recommendations: string[];
   alternativeTip: string;
   arrivalReminder: string;
+}
+
+export interface AIRecommendationRequest {
+  studentLocation: {
+    label: string;
+    lat: number;
+    lng: number;
+  };
+  matchStatus: StationMatchType;
+  selectedStationName?: string;
+  dubaiTime: {
+    weekday: string;
+    formattedTime: string;
+  };
+  selectedDay: string;
+  studentRequirements?: string;
+  nearestStation: unknown;
+  sameRouteStations: unknown[];
+  nearbyAlternatives: unknown[];
+  activeFilters: {
+    branch: string;
+    timePeriod: string;
+    maxDistanceKm: number | null;
+  };
+  unmappedStationsCount: number;
 }

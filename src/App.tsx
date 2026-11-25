@@ -1,32 +1,54 @@
 import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { Header, ActiveTab } from './components/Header';
 import { Sidebar } from './components/Sidebar';
-import { SearchByFilter } from './components/SearchByFilter';
+import { PricesPage, PricesSummaryStats } from './components/PricesPage';
 import { TransportationPage } from './components/TransportationPage';
 import { AISmartTransportFinderPage } from './components/AISmartTransportFinderPage';
 import { BranchLocationPage } from './components/BranchLocationPage';
 import { BranchInformationPage } from './components/BranchInformationPage';
 import { InstructorsPage } from './components/InstructorsPage';
-import {
-  RawMatrixRow,
-  DataSourceState,
-} from './types/pricing';
-import { loadSavedMatrix } from './services/sheetsService';
-import { normalizeMatrix } from './data/defaultPriceData';
+import { fetchPricesDataset } from './services/pricesService';
 import { AlertCircle, CheckCircle2, Info } from 'lucide-react';
 import { ThemeProvider } from './context/ThemeContext';
 import { AdminAuthProvider, ToastVariant } from './context/AdminAuthContext';
 
 export default function App() {
-  // Load initial matrix & metadata
-  const initialData = useMemo(() => loadSavedMatrix(), []);
-  const [matrix] = useState<RawMatrixRow[]>(initialData.matrix);
+  // Navigation tab state (prices | transport | ai-transport-finder | branches | branch-info | instructors)
+  const [activeTab, setActiveTab] = useState<ActiveTab>('prices');
 
-  // Compute normalized records whenever matrix changes
-  const records = useMemo(() => normalizeMatrix(matrix), [matrix]);
+  // Persistent Prices summary loaded from Cloudflare D1
+  const [pricesStats, setPricesStats] = useState<PricesSummaryStats>({
+    totalCount: 0,
+    validCount: 0,
+    categoriesCount: 0,
+    fileName: 'Cloudflare D1 Catalog',
+    importedAt: '',
+  });
 
-  // Navigation tab state (filter | transport | ai-transport-finder | branches | branch-info | instructors)
-  const [activeTab, setActiveTab] = useState<ActiveTab>('filter');
+  useEffect(() => {
+    let active = true;
+    fetchPricesDataset()
+      .then((dataset) => {
+        if (!active) return;
+        const validCount = dataset.records.filter((r) => r.priceStatus === 'valid').length;
+        const categoriesCount = new Set(
+          dataset.records.map((r) => r.category.trim()).filter(Boolean)
+        ).size;
+        setPricesStats({
+          totalCount: dataset.records.length,
+          validCount,
+          categoriesCount,
+          fileName: dataset.fileName,
+          importedAt: dataset.importedAt,
+        });
+      })
+      .catch(() => {
+        // Non-blocking: PricesPage will surface detailed D1 load status
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   // Google Maps Platform Demo Key quota banner state
   const [gmpQuotaExceeded, setGmpQuotaExceeded] = useState(false);
@@ -60,54 +82,45 @@ export default function App() {
     };
   }, []);
 
-  // Data source metrics
-  const dataSource: DataSourceState = useMemo(() => {
-    const totalCombinations = records.length;
-    const availablePrices = records.filter((r) => r.price !== null).length;
-    return {
-      type: initialData.meta.sourceType,
-      sourceName: initialData.meta.sourceName,
-      lastSyncTimestamp: initialData.meta.lastSyncTimestamp,
-      googleSheetUrl: initialData.meta.googleSheetUrl,
-      totalServicesCount: matrix.length,
-      totalPricePointsCount: totalCombinations,
-      availablePricesCount: availablePrices,
-    };
-  }, [matrix, records, initialData]);
-
   // Dynamic header titles based on active tab
   const tabDetails = useMemo(() => {
     switch (activeTab) {
       case 'transport':
         return {
           title: 'Transportation Schedule',
-          description: 'Official bus routes, student pickup points, GPS map pins, and timetables for Al Quoz and DIC centres.',
+          description:
+            'Official bus routes, student pickup points, GPS map pins, and timetables for Al Quoz and DIC centres.',
         };
       case 'ai-transport-finder':
         return {
           title: 'AI Smart Transportation Finder',
-          description: 'Locate your nearest official Eco Drive bus pickup station anywhere in Dubai, inspect walking distances, and track the next live departure.',
+          description:
+            'Locate your nearest official Eco Drive bus pickup station anywhere in Dubai, inspect walking distances, and track the next live departure.',
         };
       case 'branches':
         return {
           title: 'Branch and Location',
-          description: 'Official Eco Drive branch network across Dubai, traffic zone conditions, road training restrictions, and live availability.',
+          description:
+            'Official Eco Drive branch network across Dubai, traffic zone conditions, road training restrictions, and live availability.',
         };
       case 'branch-info':
         return {
           title: 'Branch Information',
-          description: 'Search, filter, and manage official Eco Drive registration offices, contact numbers, and locations.',
+          description:
+            'Search, filter, and manage official Eco Drive registration offices, contact numbers, and locations.',
         };
       case 'instructors':
         return {
           title: 'Instructors',
-          description: 'Search, filter, and manage Eco Drive driving instructors directly from the imported Excel directory.',
+          description:
+            'Search, filter, and manage Eco Drive driving instructors directly from the imported Excel directory.',
         };
-      case 'filter':
+      case 'prices':
       default:
         return {
-          title: 'Search by Filter',
-          description: 'Multi-criteria tariff lookup combining Category, Fee Type, specific Service, and AED Price Range.',
+          title: 'Prices',
+          description:
+            'Cloudflare D1 persistent course tariffs, category filtering, Excel multi-sheet import, and instant price lookup.',
         };
     }
   }, [activeTab]);
@@ -120,7 +133,7 @@ export default function App() {
           <Sidebar
             activeTab={activeTab}
             setActiveTab={setActiveTab}
-            dataSource={dataSource}
+            pricesStats={pricesStats}
           />
 
           {/* 2. Main Content Viewport */}
@@ -146,7 +159,7 @@ export default function App() {
             <Header
               activeTab={activeTab}
               setActiveTab={setActiveTab}
-              dataSource={dataSource}
+              pricesStats={pricesStats}
             />
 
             {/* Hero Banner Strip (Royal Green & Dark Forest with Official Eco Drive Logo) */}
@@ -161,7 +174,7 @@ export default function App() {
                         className="h-10 w-auto object-contain"
                         onError={(e) => {
                           (e.currentTarget as HTMLImageElement).src =
-                            "https://www.ecodrivedubai.com/wp-content/uploads/2026/01/eco-drive-logo_White-01-768x313.png";
+                            'https://www.ecodrivedubai.com/wp-content/uploads/2026/01/eco-drive-logo_White-01-768x313.png';
                         }}
                       />
                     </div>
@@ -185,9 +198,11 @@ export default function App() {
                     <div className="bg-[#004d32]/80 backdrop-blur-xs px-3.5 py-2 rounded-xl text-xs text-emerald-100 flex items-center gap-2 border border-emerald-500/20 shadow-xs">
                       <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
                       <div>
-                        <span className="block font-semibold text-white">Source of Truth Active</span>
+                        <span className="block font-semibold text-white">Cloudflare D1 Active</span>
                         <span className="text-[11px] text-emerald-200/70">
-                          {dataSource.availablePricesCount} Verified Rates · Decimals Preserved
+                          {pricesStats.totalCount > 0
+                            ? `${pricesStats.validCount} Valid Prices · ${pricesStats.categoriesCount} Categories`
+                            : 'Ready for Excel Price Import'}
                         </span>
                       </div>
                     </div>
@@ -198,43 +213,40 @@ export default function App() {
 
             {/* Workspace Container */}
             <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex-1 w-full">
-
-              {activeTab === 'filter' && (
-                <SearchByFilter
-                  records={records}
-                  matrix={matrix}
+              {activeTab === 'prices' && (
+                <PricesPage
+                  onShowToast={showToast}
+                  onDatasetStatsChange={setPricesStats}
                 />
               )}
 
-              {activeTab === 'transport' && (
-                <TransportationPage />
-              )}
+              {activeTab === 'transport' && <TransportationPage />}
 
-              {activeTab === 'ai-transport-finder' && (
-                <AISmartTransportFinderPage />
-              )}
+              {activeTab === 'ai-transport-finder' && <AISmartTransportFinderPage />}
 
-              {activeTab === 'branches' && (
-                <BranchLocationPage />
-              )}
+              {activeTab === 'branches' && <BranchLocationPage />}
 
               {activeTab === 'branch-info' && (
                 <BranchInformationPage onShowToast={showToast} />
               )}
 
-              {activeTab === 'instructors' && (
-                <InstructorsPage onShowToast={showToast} />
-              )}
+              {activeTab === 'instructors' && <InstructorsPage onShowToast={showToast} />}
             </main>
 
             {/* Footer */}
             <footer className="bg-white dark:bg-[#0F172A] border-t border-[#E2E8F0] dark:border-slate-800 py-4 mt-auto transition-colors duration-200">
               <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between text-xs text-[#64748B] dark:text-slate-400 gap-2">
-                <span className="font-medium text-[#0F172A] dark:text-slate-200">Eco Drive · Eco Drive Driving institute Tariff Search</span>
+                <span className="font-medium text-[#0F172A] dark:text-slate-200">
+                  Eco Drive · Eco Drive Driving institute Operations &amp; Prices Portal
+                </span>
                 <div className="flex items-center gap-4">
-                  <span>21 Verified Services</span>
+                  <span>
+                    {pricesStats.totalCount > 0
+                      ? `${pricesStats.totalCount} D1 Price Records`
+                      : 'Prices Catalog (D1)'}
+                  </span>
                   <span>·</span>
-                  <span>All Currency in AED</span>
+                  <span>Dubai, UAE</span>
                 </div>
               </div>
             </footer>

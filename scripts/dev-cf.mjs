@@ -24,7 +24,7 @@ function runStep(cmd, args) {
 runStep('npx', ['vite', 'build']);
 
 // 2. Apply Cloudflare D1 migrations to local state (idempotent & non-destructive)
-runStep('npx', ['wrangler', 'd1', 'migrations', 'apply', 'ecodrive-db', '--local']);
+runStep('npx', ['wrangler', 'd1', 'migrations', 'apply', 'ecodrive-db', '--local', '--force']);
 
 // 3. Forward optional runtime secrets from host environment to local Worker
 const wranglerArgs = [
