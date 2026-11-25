@@ -7,7 +7,7 @@ coverage/
 .env*
 !.env.example
 .gmp_cache/
-data/
+/data/
 .wrangler/
 .wrangler-dryrun/
 .dev.vars
