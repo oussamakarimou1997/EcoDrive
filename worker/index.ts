@@ -1,3 +1,4 @@
+import { handleOpenWalkingRoute } from './openWalkingRoute';
 import { GoogleGenAI, Type } from '@google/genai';
 import { Env } from './types';
 import { getServerMapsApiKey, resolveOfficialTransportPins } from './transportPins';
@@ -571,6 +572,10 @@ async function handleApiRequest(request: Request, env: Env, url: URL): Promise<R
 
   try {
     // 1. Transportation & Google Maps Routes
+    if (pathname === '/api/maps/walking-route' && method === 'POST') {
+      return handleOpenWalkingRoute(request, env.ORS_API_KEY);
+    }
+
     if (pathname === '/api/transport/resolved-pins' && method === 'GET') {
       return await handleResolvedPins(env);
     }
