@@ -9,7 +9,7 @@ export async function handleOpenWalkingRoute(request: Request, apiKey?: string):
   if (!valid(body?.origin) || !valid(body?.destination)) return reply({error:'Invalid coordinates'},400);
   const {origin, destination} = body;
   try {
-    const response = await fetch('https://api.openrouteservice.org/v2/directions/foot-walking/geojson', {
+    const response = await fetch('https://api.heigit.org/openrouteservice/v2/directions/foot-walking/geojson', {
       method:'POST', headers:{Authorization:apiKey,'Content-Type':'application/json'},
       body:JSON.stringify({coordinates:[[origin.lng,origin.lat],[destination.lng,destination.lat]]}),
       signal:AbortSignal.timeout(12000),
