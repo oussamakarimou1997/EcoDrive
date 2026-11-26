@@ -1,4 +1,5 @@
 export interface Env {
+  ORS_API_KEY?: string;
   DB: D1Database;
   ASSETS: Fetcher;
   GEMINI_API_KEY?: string;
