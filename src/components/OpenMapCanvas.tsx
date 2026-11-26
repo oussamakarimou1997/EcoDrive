@@ -62,7 +62,7 @@ export function OpenMapCanvas({ center, onReady, onPick, pickerMode }: OpenMapCa
   }, [pickerMode]);
   return (
     <div className="relative w-full h-[420px] sm:h-[500px] bg-slate-100 dark:bg-slate-900">
-      <div ref={container} className="absolute inset-0" />
+      <div ref={container} className="absolute inset-0" style={{ position: 'absolute' }} />
       {failed && <div role="alert" className="absolute top-3 left-3 right-12 rounded-lg bg-white p-3 text-sm text-slate-800 shadow">Map unavailable. Please retry or use address search.</div>}
     </div>
   );
