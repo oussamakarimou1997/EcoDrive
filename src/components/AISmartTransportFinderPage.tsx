@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { APIProvider, useMapsLibrary } from '@vis.gl/react-google-maps';
+import {searchDubaiAddress, reverseDubaiAddress} from '../services/openMapGeocoding';
 import {
   Sparkles,
   MapPin,
@@ -62,15 +62,9 @@ const DEFAULT_FILTERS: SmartTransportFilters = {
   maxDistanceKm: null,
 };
 
-const DUBAI_QUICK_BOUNDS: google.maps.LatLngBoundsLiteral = {
-  north: 25.45,
-  south: 24.75,
-  east: 55.65,
-  west: 54.85,
-};
 
 const AISmartTransportFinderContent: React.FC = () => {
-  const placesLib = useMapsLibrary('places');
+
 
   // 1. Source-of-truth resolved pin coordinates from Express backend
   const [pinsData, setPinsData] = useState<ResolvedPinsResponse>({
@@ -315,68 +309,10 @@ const AISmartTransportFinderContent: React.FC = () => {
   };
 
   // Resolve free-text area query only when user didn't already pick a suggestion or exact station
-  const resolveAreaTextToLocation = useCallback(
-    async (rawQuery: string): Promise<StudentLocation | null> => {
-      const trimmed = rawQuery.trim();
-      if (!trimmed) return null;
-
-      try {
-        const resp = await fetch(`/api/maps/geocode?address=${encodeURIComponent(trimmed)}`);
-        const data = (await resp.json()) as {
-          quotaExceeded?: boolean;
-          result?: { lat: number; lng: number; formattedAddress: string } | null;
-        };
-        if (resp.status === 429 || data.quotaExceeded) {
-          window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
-        }
-        if (resp.ok && data.result) {
-          return {
-            lat: data.result.lat,
-            lng: data.result.lng,
-            label: data.result.formattedAddress,
-            areaName: trimmed,
-            source: 'autocomplete',
-          };
-        }
-      } catch {
-        // Fall through to Google Places client SDK
-      }
-
-      if (placesLib?.Place?.searchByText) {
-        try {
-          const { places } = await placesLib.Place.searchByText({
-            textQuery: trimmed.toLowerCase().includes('dubai') ? trimmed : `${trimmed}, Dubai, UAE`,
-            fields: ['displayName', 'formattedAddress', 'location'],
-            locationBias: DUBAI_QUICK_BOUNDS,
-            region: 'AE',
-            maxResultCount: 1,
-          });
-          const found = places?.[0];
-          if (found?.location) {
-            return {
-              lat: found.location.lat(),
-              lng: found.location.lng(),
-              label: found.formattedAddress || found.displayName || trimmed,
-              areaName: found.displayName || trimmed,
-              source: 'autocomplete',
-            };
-          }
-        } catch (placesErr: unknown) {
-          const msg = String(placesErr instanceof Error ? placesErr.message : placesErr || '');
-          if (
-            msg.includes('RESOURCE_EXHAUSTED') ||
-            msg.includes('OVER_QUERY_LIMIT') ||
-            msg.includes('429')
-          ) {
-            window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
-          }
-        }
-      }
-
-      return null;
-    },
-    [placesLib]
-  );
+  const resolveAreaTextToLocation = useCallback(async (rawQuery: string): Promise<StudentLocation | null> => {
+    try { return (await searchDubaiAddress(rawQuery))[0] ?? null; }
+    catch { return null; }
+  }, []);
 
   // Direct Official Station selection (strictly preserves selected station)
   const handleSelectDirectOfficialStation = useCallback(
@@ -571,17 +507,8 @@ const AISmartTransportFinderContent: React.FC = () => {
         let areaName = 'Current Location';
 
         try {
-          const resp = await fetch(`/api/maps/reverse-geocode?lat=${lat}&lng=${lng}`);
-          const data = (await resp.json()) as {
-            quotaExceeded?: boolean;
-            formattedAddress?: string;
-            areaName?: string;
-          };
-          if (resp.status === 429 || data.quotaExceeded) {
-            window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
-          }
-          if (data.formattedAddress) label = data.formattedAddress;
-          if (data.areaName) areaName = data.areaName;
+          const result = await reverseDubaiAddress(lat,lng,'geolocation');
+          label = result.label; areaName = result.areaName || areaName;
         } catch {
           // Keep coordinate label if reverse geocode fails
         }
@@ -1327,7 +1254,7 @@ const AISmartTransportFinderContent: React.FC = () => {
                         </span>
                         <span className="block text-[10px] text-[#006B45]/80 dark:text-emerald-400/80">
                           {walkingRouteInfo.status === 'available'
-                            ? 'Google Routes walking path'
+                            ? 'OpenRouteService walking path'
                             : walkingRouteInfo.reason || 'Straight-line used'}
                         </span>
                       </div>
@@ -2082,16 +2009,4 @@ const AISmartTransportFinderContent: React.FC = () => {
   );
 };
 
-export const AISmartTransportFinderPage: React.FC = () => {
-  const mapsApiKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY || '';
-  return (
-    <APIProvider
-      apiKey={mapsApiKey}
-      language="en"
-      region="AE"
-      libraries={['places', 'marker', 'routes']}
-    >
-      <AISmartTransportFinderContent />
-    </APIProvider>
-  );
-};
+export const AISmartTransportFinderPage: React.FC = () => <AISmartTransportFinderContent />;
