@@ -36,6 +36,43 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
   const [routeId,setRouteId]=useState('');
   const [review,setReview]=useState(false);
   const [pdf,setPdf]=useState<{name:string;url:string}|null>(null);
+  const [pdfRoutes,setPdfRoutes]=useState<{code:string;title:string}[]>([]);
+  useEffect(()=>{setPdfRoutes([]);},[pdf]);
+  async function extractRoutes(){
+    if(!pdf)return;
+    setBusy(true);setError('');setPdfRoutes([]);
+    let doc:any;
+    try {
+      // Version-pinned PDF.js; PDF bytes are processed locally in the browser.
+      const url='https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.mjs';
+      const lib=await import(/* @vite-ignore */ url);
+      lib.GlobalWorkerOptions.workerSrc='https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.mjs';
+      doc=await lib.getDocument({data:await (await fetch(pdf.url)).arrayBuffer(),isEvalSupported:false}).promise;
+      const found=new Map<string,{code:string;title:string}>();
+      for(let n=1;n<=doc.numPages;n++){
+        const page=await doc.getPage(n);
+        const content=await page.getTextContent();
+        const lines=new Map<number,{x:number;str:string}[]>();
+        for(const item of content.items){
+          if(!('str' in item)||!item.str.trim())continue;
+          const y=Math.round(item.transform[5]*2)/2;
+          const line=lines.get(y)||[];
+          line.push({x:item.transform[4],str:item.str});lines.set(y,line);
+        }
+        for(const line of lines.values()){
+          const value=line.sort((a,b)=>a.x-b.x).map(i=>i.str).join(' ').replace(/\s+/g,' ').trim();
+          const match=value.match(/^ROUTE\s+(\d+)\s*[-–—]\s*(.+)$/i);
+          if(!match)continue;
+          const code='ROUTE '+Number(match[1]),title=match[2].trim();
+          if(found.has(code)&&found.get(code)?.title!==title)throw new Error('Conflicting headings for '+code);
+          found.set(code,{code,title});
+        }
+      }
+      if(!found.size)throw new Error('No route headings found. Select a text-based schedule PDF.');
+      setPdfRoutes([...found.values()].sort((a,b)=>Number(a.code.slice(6))-Number(b.code.slice(6))));
+    }catch(e){setError(e instanceof Error?e.message:String(e));}
+    finally{try{await doc?.destroy();}finally{setBusy(false);}}
+  }
   useEffect(()=>()=>{if(pdf)URL.revokeObjectURL(pdf.url);},[pdf]);
   useEffect(()=>{setPdf(null);},[center,auth.isAuthorized]);
   async function selectPdf(file:File|undefined){
@@ -104,7 +141,9 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
           <input type="file" accept=".pdf,application/pdf" className="sr-only" onChange={e=>{void selectPdf(e.target.files?.[0]);e.target.value='';}}/>
         </label>
         {pdf&&<div className="space-y-2"><div className="flex flex-wrap items-center justify-between gap-2 text-xs"><span>{pdf.name}</span><div className="flex gap-2"><a href={pdf.url} target="_blank" rel="noopener noreferrer" className={button}>Open PDF</a><button className={button} onClick={()=>setPdf(null)}>Remove PDF</button></div></div><iframe title="Schedule PDF preview" src={pdf.url} className="w-full h-96 rounded-lg border border-slate-300 dark:border-slate-700"/></div>}
-        <p className="text-xs text-slate-500 dark:text-slate-400">Local PDF preview only. Automatic extraction is not available yet. Selecting a PDF does not change published schedules.</p>
+        {pdf&&<button className={primary} onClick={()=>void extractRoutes()}>Extract Routes</button>}
+        {pdfRoutes.length>0&&<div className="space-y-2"><h4 className="font-bold text-sm">{pdfRoutes.length} routes found</h4>{pdfRoutes.map(r=><div key={r.code} className="text-xs border-b border-slate-200 dark:border-slate-800 py-2"><strong>{r.code}</strong> — {r.title}</div>)}</div>}
+        <p className="text-xs text-slate-500 dark:text-slate-400">Route extraction preview only. Verify the centre and route headings against the PDF. No schedule changes are saved.</p>
       </div>
       <div className="flex gap-2 flex-wrap"><select aria-label="Route" className={field+' max-w-md'} value={routeId} onChange={e=>setRouteId(e.target.value)}><option value="">Select route</option>{snapshot.transport_routes.map(r=><option key={String(r.id)} value={String(r.id)}>{r.route_code} — {r.title}</option>)}</select><button className={button} onClick={addRoute}>+ Route</button></div>
       {route&&<>
