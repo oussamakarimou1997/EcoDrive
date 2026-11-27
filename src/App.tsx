@@ -17,8 +17,12 @@ import type { TransportRoute } from './types/transportation';
 
 export default function App() {
   const [transportStatus, setTransportStatus] = useState<'loading'|'live'|'fallback'>('loading');
+  const [transportRevision, setTransportRevision] = useState(0);
+  // Revalidate on navigation into transport; do not interrupt an open admin draft.
+  const [activeTab, setActiveTab] = useState<ActiveTab>('prices');
   useEffect(() => {
     let active = true;
+    setTransportStatus('loading');
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), 5000);
     fetch('/api/transport/catalog', {signal:controller.signal, cache:'no-store'})
@@ -36,15 +40,13 @@ export default function App() {
           center.badge=routes.length+' Routes • '+names.length+' Key Stops';
           center.description='Serving '+names.join(', ')+'.';
         }
+        setTransportRevision(v => v + 1);
         setTransportStatus('live');
       })
       .catch(()=>{if(active) setTransportStatus('fallback');})
       .finally(()=>window.clearTimeout(timer));
     return ()=>{active=false;controller.abort();window.clearTimeout(timer);};
-  }, []);
-
-  // Navigation tab state (prices | transport | ai-transport-finder | branches | branch-info | instructors)
-  const [activeTab, setActiveTab] = useState<ActiveTab>('prices');
+  }, [activeTab]);
 
   // Persistent Prices summary loaded from Cloudflare D1
   const [pricesStats, setPricesStats] = useState<PricesSummaryStats>({
@@ -255,9 +257,9 @@ export default function App() {
                   {transportStatus === 'loading' ? 'Loading transportation schedules…' : 'Live schedules unavailable. Showing saved schedules; confirm times before travel.'}
                 </div>
               )}
-              {activeTab === 'transport' && transportStatus !== 'loading' && <TransportationPage />}
+              {activeTab === 'transport' && transportStatus !== 'loading' && <TransportationPage key={transportRevision} />}
 
-              {activeTab === 'ai-transport-finder' && transportStatus !== 'loading' && <AISmartTransportFinderPage />}
+              {activeTab === 'ai-transport-finder' && transportStatus !== 'loading' && <AISmartTransportFinderPage key={transportRevision} />}
 
               {activeTab === 'branches' && <BranchLocationPage />}
 
