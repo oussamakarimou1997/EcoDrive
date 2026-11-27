@@ -1,3 +1,4 @@
+import { getTripReturnDepartures, formatReturnDeparture } from '../types/transportation';
 import { TRANSPORT_CENTERS, TRANSPORT_ROUTES } from '../data/transportationData';
 import { CenterId } from '../types/transportation';
 import {
@@ -353,7 +354,7 @@ export function buildStationsFromSource(
           minutesFromMidnight: mins,
           period: getTimePeriod(mins),
           etaAtCentre: trip.eta,
-          returnDeparture: route.departures ? (route.departures.map(d => d.time + (d.destination ? ' ' + d.destination : '')).join(' / ') || '—') : trip.departure,
+          returnDeparture: route.departures ? (getTripReturnDepartures(route, trip).map(formatReturnDeparture).join(' / ') || '—') : trip.departure,
           notes: route.departures ? undefined : trip.notes,
         });
       }
