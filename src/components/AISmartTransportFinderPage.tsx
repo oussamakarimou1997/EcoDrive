@@ -157,6 +157,8 @@ const AISmartTransportFinderContent: React.FC = () => {
   const [aiLoading, setAiLoading] = useState(false);
   const [aiEnhanced, setAiEnhanced] = useState(false);
   const aiCooldownUntil = useRef(0);
+  const aiCache = useRef(new Map<string, { expiresAt: number; insights: string[] }>());
+  const [aiCacheHit, setAiCacheHit] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
 
   const step2SectionRef = useRef<HTMLElement>(null);
@@ -686,13 +688,28 @@ const AISmartTransportFinderContent: React.FC = () => {
         setAiLoading(false);
       }
       setAiEnhanced(false);
-      if (!station || !station.departures.length || Date.now() < aiCooldownUntil.current) return;
+      setAiCacheHit(false);
+      if (!station || !station.departures.length || controller.signal.aborted) return;
+      // Exact context key includes schedule, branch, location, filters and current bus.
+      // Omit countdown and clock from AI input: local guidance owns live timing.
+      const aiPayload = { ...payload, dubaiTime: { weekday: payload.dubaiTime.weekday }, nearestStation: { ...station, nextBus: station.nextBus ? { ...station.nextBus, minutesRemaining: undefined } : null } };
+      const cacheKey = JSON.stringify(aiPayload);
+      const now = Date.now();
+      for (const [key, entry] of aiCache.current) if (entry.expiresAt <= now) aiCache.current.delete(key);
+      const cached = aiCache.current.get(cacheKey);
+      if (cached) {
+        setAiData({ ...local, recommendations: [...local.recommendations, ...cached.insights] });
+        setAiEnhanced(true);
+        setAiCacheHit(true);
+        return;
+      }
+      if (now < aiCooldownUntil.current) return;
       // Keep verified local guidance visible; AI is optional and never replaces schedule facts.
       const timeout = window.setTimeout(() => { aiCooldownUntil.current = Date.now() + 60000; controller.abort(); }, 8000);
       fetch('/api/transport/ai-recommendations', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(aiPayload),
         signal: controller.signal,
       }).then(async (response) => {
         if (!response.ok) {
@@ -706,7 +723,11 @@ const AISmartTransportFinderContent: React.FC = () => {
             !data.recommendations.every(v => typeof v === 'string' && v.trim()) ||
             typeof data.alternativeTip !== 'string' || typeof data.arrivalReminder !== 'string') return;
         // Keep official facts intact and display AI wording separately.
-        setAiData({ ...local, recommendations: [...local.recommendations, ...data.recommendations.map(v => 'AI insight: ' + v)] });
+        const insights = data.recommendations.filter(v => !/\b(?:minutes? remaining|minutes? left|hours? remaining|hours? left|in \d+ (?:minutes?|hours?))\b/i.test(v)).map(v => 'AI insight: ' + v);
+        if (!insights.length) return;
+        if (aiCache.current.size >= 32) { const oldest = aiCache.current.keys().next().value; if (oldest !== undefined) aiCache.current.delete(oldest); }
+        aiCache.current.set(cacheKey, { expiresAt: Date.now() + 300000, insights });
+        setAiData({ ...local, recommendations: [...local.recommendations, ...insights] });
         setAiEnhanced(true);
       }).catch(() => {
         if (!controller.signal.aborted) aiCooldownUntil.current = Date.now() + 60000;
@@ -1505,7 +1526,7 @@ const AISmartTransportFinderContent: React.FC = () => {
                     Local Smart Assistant ({selectedBranchMeta.shortName})
                   </h3>
                   <p className="text-[11px] text-[#006B45] dark:text-emerald-400">
-                    Schedule-based guidance for {selectedBranchMeta.title} · {aiEnhanced ? 'AI-enhanced' : 'Local guidance'}
+                    Schedule-based guidance for {selectedBranchMeta.title} · {aiEnhanced ? (aiCacheHit ? 'AI-enhanced · Cached' : 'AI-enhanced') : 'Local guidance'}
                   </p>
                 </div>
               </div>
