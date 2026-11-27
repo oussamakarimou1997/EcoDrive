@@ -671,6 +671,16 @@ const AISmartTransportFinderContent: React.FC = () => {
         } else {
           recommendations.push('No next pickup is available under the current filters. Check the schedule or adjust filters.');
         }
+        // Live feasibility is computed locally, never inferred by Gemini.
+        if (station.nextBus && !station.nextBus.isNextDay && station.walkingDurationMinutes !== null) {
+          const remaining = station.nextBus.minutesRemaining;
+          const required = station.walkingDurationMinutes + 10;
+          if (Number.isFinite(remaining)) {
+            recommendations.push(remaining >= required
+              ? 'Allow ' + required + ' minutes for walking and a 10-minute boarding buffer before pickup.'
+              : 'The next pickup may be too soon for the estimated walk and boarding buffer. Check the following scheduled pickup.');
+          }
+        }
         if (station.departures.length) recommendations.push('Scheduled pickups: ' + station.departures.map(d => d.time).join(', ') + '.');
       } else {
         recommendations.push('Try adjusting the distance or time filters within the selected branch.');
@@ -693,7 +703,7 @@ const AISmartTransportFinderContent: React.FC = () => {
       // Exact context key includes schedule, branch, location, filters and current bus.
       // Omit countdown and clock from AI input: local guidance owns live timing.
       const aiPayload = { ...payload, dubaiTime: { weekday: payload.dubaiTime.weekday }, nearestStation: { ...station, nextBus: station.nextBus ? { ...station.nextBus, minutesRemaining: undefined } : null } };
-      const cacheKey = JSON.stringify(aiPayload);
+      const cacheKey = 'advice-v2:' + JSON.stringify(aiPayload);
       const now = Date.now();
       for (const [key, entry] of aiCache.current) if (entry.expiresAt <= now) aiCache.current.delete(key);
       const cached = aiCache.current.get(cacheKey);
@@ -723,7 +733,15 @@ const AISmartTransportFinderContent: React.FC = () => {
             !data.recommendations.every(v => typeof v === 'string' && v.trim()) ||
             typeof data.alternativeTip !== 'string' || typeof data.arrivalReminder !== 'string') return;
         // Keep official facts intact and display AI wording separately.
-        const insights = data.recommendations.filter(v => !/\b(?:minutes? remaining|minutes? left|hours? remaining|hours? left|in \d+ (?:minutes?|hours?))\b/i.test(v)).map(v => 'AI insight: ' + v);
+        const normalize = (v: string) => v.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+        const existing = new Set(local.recommendations.map(normalize));
+        const insights = data.recommendations.map(v => v.trim()).filter(v => {
+          const key = normalize(v);
+          if (!key || existing.has(key) || v.split(/\s+/).length > 25 ||
+              /\d|straight.line distance|walking distance|scheduled pickups|pickup landmark|next pickup is|next available bus/i.test(v)) return false;
+          existing.add(key);
+          return true;
+        }).slice(0, 2).map(v => 'AI insight: ' + v);
         if (!insights.length) return;
         if (aiCache.current.size >= 32) { const oldest = aiCache.current.keys().next().value; if (oldest !== undefined) aiCache.current.delete(oldest); }
         aiCache.current.set(cacheKey, { expiresAt: Date.now() + 300000, insights });
