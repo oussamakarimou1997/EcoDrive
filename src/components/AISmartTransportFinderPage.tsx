@@ -155,6 +155,8 @@ const AISmartTransportFinderContent: React.FC = () => {
   const [aiRefreshNonce, setAiRefreshNonce] = useState(0);
   const [aiData, setAiData] = useState<AIRecommendationResponse | null>(null);
   const [aiLoading, setAiLoading] = useState(false);
+  const [aiEnhanced, setAiEnhanced] = useState(false);
+  const aiCooldownUntil = useRef(0);
   const [aiError, setAiError] = useState<string | null>(null);
 
   const step2SectionRef = useRef<HTMLElement>(null);
@@ -683,6 +685,33 @@ const AISmartTransportFinderContent: React.FC = () => {
         setAiError(null);
         setAiLoading(false);
       }
+      setAiEnhanced(false);
+      if (!station || !station.departures.length || Date.now() < aiCooldownUntil.current) return;
+      // Keep verified local guidance visible; AI is optional and never replaces schedule facts.
+      const timeout = window.setTimeout(() => { aiCooldownUntil.current = Date.now() + 60000; controller.abort(); }, 8000);
+      fetch('/api/transport/ai-recommendations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      }).then(async (response) => {
+        if (!response.ok) {
+          aiCooldownUntil.current = Date.now() + (response.status === 429 ? 300000 : 60000);
+          return;
+        }
+        const data = await response.json() as Partial<AIRecommendationResponse>;
+        if (controller.signal.aborted) return;
+        if (typeof data.headline !== 'string' || !data.headline.trim() ||
+            !Array.isArray(data.recommendations) || !data.recommendations.length ||
+            !data.recommendations.every(v => typeof v === 'string' && v.trim()) ||
+            typeof data.alternativeTip !== 'string' || typeof data.arrivalReminder !== 'string') return;
+        // Keep official facts intact and display AI wording separately.
+        setAiData({ ...local, recommendations: [...local.recommendations, ...data.recommendations.map(v => 'AI insight: ' + v)] });
+        setAiEnhanced(true);
+      }).catch(() => {
+        if (!controller.signal.aborted) aiCooldownUntil.current = Date.now() + 60000;
+      }).finally(() => window.clearTimeout(timeout));
+
     }, 250);
 
     return () => {
@@ -1476,7 +1505,7 @@ const AISmartTransportFinderContent: React.FC = () => {
                     Local Smart Assistant ({selectedBranchMeta.shortName})
                   </h3>
                   <p className="text-[11px] text-[#006B45] dark:text-emerald-400">
-                    Schedule-based guidance for {selectedBranchMeta.title} · No external AI required
+                    Schedule-based guidance for {selectedBranchMeta.title} · {aiEnhanced ? 'AI-enhanced' : 'Local guidance'}
                   </p>
                 </div>
               </div>
