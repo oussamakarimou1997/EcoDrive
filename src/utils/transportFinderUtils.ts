@@ -353,8 +353,8 @@ export function buildStationsFromSource(
           minutesFromMidnight: mins,
           period: getTimePeriod(mins),
           etaAtCentre: trip.eta,
-          returnDeparture: trip.departure,
-          notes: trip.notes,
+          returnDeparture: route.departures ? (route.departures.map(d => d.time + (d.destination ? ' ' + d.destination : '')).join(' / ') || '—') : trip.departure,
+          notes: route.departures ? undefined : trip.notes,
         });
       }
     }
