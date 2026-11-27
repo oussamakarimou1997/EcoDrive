@@ -181,7 +181,7 @@ async function resolvePinBatch(urls: string[], concurrency = 5): Promise<void> {
   }
 }
 
-function extractOfficialPinUrlsFromData(routes: {stops:{pinUrl?:string}[]} = TRANSPORT_ROUTES): {
+function extractOfficialPinUrlsFromData(routes: {stops:{pinUrl?:string}[]}[] = TRANSPORT_ROUTES): {
   transportPinUrls: string[];
   alQuozCenterUrl: string | null;
   dicReferenceBranchUrl: string | null;
@@ -226,7 +226,7 @@ export async function resolveOfficialTransportPins(env: Env): Promise<{
     { lat: number; lng: number; label: string; pinUrl?: string } | null
   >;
 }> {
-  let routes: {stops:{pinUrl?:string}[]} = TRANSPORT_ROUTES;
+  let routes: {stops:{pinUrl?:string}[]}[] = TRANSPORT_ROUTES;
   try {
     const result = await env.DB.prepare('SELECT s.pin_url FROM transport_stops s JOIN transport_routes r ON r.id=s.route_id WHERE s.active=1 AND r.active=1').all<{pin_url:string|null}>();
     if (result.success && result.results.length) routes=[{stops:result.results.map(s=>({pinUrl:s.pin_url ?? undefined}))}];
