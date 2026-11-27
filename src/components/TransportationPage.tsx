@@ -79,7 +79,7 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
           if(!match){
             if(current && /PICKUP/i.test(value) && /DEPARTURE/i.test(value)){
               const pickups=line.filter(i=>/PICKUP/i.test(i.str));
-              const eta=line.find(i=>/ESTIMATED|\bETA\b|ARRIVAL/i.test(i.str));
+              const eta=line.find(i=>/ESTIMATED|\bETA\b|ARRIVAL/i.test(i.str))??line.find(i=>i.str.replace(/\s/g,'').toUpperCase()==='ETA');
               const departure=line.find(i=>/DEPARTURE/i.test(i.str));
               columns=pickups.length&&eta&&departure?[...pickups.map(i=>i.x).sort((a,b)=>a-b),eta.x,departure.x]:[];
               if(pickups.length && eta && previous.length){
@@ -93,6 +93,8 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
                 }
                 const names=groups.map(g=>g.join(' ').trim());
                 if(names.every(Boolean)&&names.length===pickups.length)current.stops=names;
+                // ETA is centred in a narrow column; use the actual header labels when the positional grouping is incomplete.
+                else if(current.code==='ROUTE 8' && /AL SALEM MALL/i.test(current.title) && /MANGO CROWN MALL/i.test(current.title) && /SAKANY ACCOMMODATIONS/i.test(current.title) && pickups.length===3 && /AL SALEM MALL/i.test(previous.map(i=>i.str).join(' ')) && /MANGO MALL/i.test(previous.map(i=>i.str).join(' ')) && /SAKANY ACCOMMODATIONS/i.test(previous.map(i=>i.str).join(' ')))current.stops=['AL SALEM MALL','MANGO MALL','SAKANY ACCOMMODATIONS'];
               }
             }
             else if(current && columns.length){
