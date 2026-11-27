@@ -280,7 +280,9 @@ export function buildStationsFromSource(
     const centerName = centerLookup[route.centerId];
 
     for (const stop of route.stops) {
-      const coords = stop.pinUrl ? resolvedPins[stop.pinUrl] ?? null : null;
+      const coords = typeof stop.latitude === 'number' && typeof stop.longitude === 'number' && Number.isFinite(stop.latitude) && Number.isFinite(stop.longitude) && stop.latitude >= 22.5 && stop.latitude <= 26.5 && stop.longitude >= 51 && stop.longitude <= 56.5
+        ? { lat: stop.latitude, lng: stop.longitude }
+        : stop.pinUrl ? resolvedPins[stop.pinUrl] ?? null : null;
       const groupKey = normalizeStationGroupKey(branchCode, stop.name, stop.landmark, coords);
 
       if (!stationMap[groupKey]) {
