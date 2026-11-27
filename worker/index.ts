@@ -794,7 +794,7 @@ async function handleApiRequest(request: Request, env: Env, url: URL): Promise<R
     if (pathname === '/api/admin/logout' && method === 'POST') {
       try {
         const token = extractBearerToken(request);
-        await revokeAdminSessionToken(env.DB, token);
+        await revokeAdminSessionToken(env.DB, token, env.ADMIN_ACCESS_CODE);
         return jsonResponse({ locked: true }, 200);
       } catch (err) {
         console.error('Error locking admin session:', err);
