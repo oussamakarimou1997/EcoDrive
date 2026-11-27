@@ -243,7 +243,27 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
       {rows('transport_departures').map(({row,index})=><div key={String(row.id)} className="grid grid-cols-2 md:grid-cols-4 gap-2">{['departure_time','destination','notes','position'].map(k=>edit('transport_departures',index,row,k,k==='position'))}<button className={button+' text-red-600'} onClick={()=>remove('transport_departures',row)}>Remove departure</button></div>)}
       </>}
       <div className="flex gap-2"><button className={primary} disabled={!dirty} onClick={()=>setReview(true)}>Review changes</button></div>
-      {review&&<div className="border rounded-xl p-3 space-y-2"><h3 className="font-bold">Review before publish</h3>{sourceFilename&&<p className="text-xs text-amber-600">Imported from {sourceFilename}. Verify every stop, GPS link, departure and removed route before publishing.</p>}{Object.keys(snapshot).map(k=>{const before=original?.[k]||[];const after=snapshot[k];return <p key={k} className="text-xs">{k.replace('transport_','').replaceAll('_',' ')}: {before.length} → {after.length} rows; {after.filter(r=>!before.some(b=>JSON.stringify(b)===JSON.stringify(r))).length} new or changed</p>;})}<button className={primary} onClick={()=>publish()}>Publish</button></div>}
+      {review&&<div className="border rounded-xl p-3 space-y-3">
+        <h3 className="font-bold">Review before publish</h3>
+        {sourceFilename&&<p className="text-xs">Imported from {sourceFilename}</p>}
+        <p className="text-xs text-amber-600">Check all changes against the official PDF. Newly generated trip IDs appear as removed and added rows.</p>
+        {Object.keys(snapshot).map(k=>{
+          const before=original?.[k]||[],after=snapshot[k];
+          const key=(r:TransportRow)=>k==='transport_stop_times'?String(r.trip_id)+'|'+String(r.stop_id):String(r.id);
+          const oldMap=new Map(before.map(r=>[key(r),r])),newMap=new Map(after.map(r=>[key(r),r]));
+          const added=after.filter(r=>!oldMap.has(key(r))),removed=before.filter(r=>!newMap.has(key(r)));
+          const changed=after.filter(r=>{const old=oldMap.get(key(r));return old&&Object.keys({...old,...r}).some(f=>old[f]!==r[f]);});
+          const describe=(r:TransportRow)=>Object.entries(r).filter(([f])=>!['id','route_id','trip_id','stop_id'].includes(f)).map(([f,v])=>f.replaceAll('_',' ')+': '+(v??'—')).join(' · ');
+          const context=(r:TransportRow,old=false)=>{const data=old?original:snapshot;const route=data?.transport_routes.find(x=>x.id===(r.route_id??r.id));const stop=data?.transport_stops.find(x=>x.id===r.stop_id);return [route?.route_code,stop?.name].filter(Boolean).join(' / ');};
+          return <details key={k} className="border rounded-lg p-2"><summary className="cursor-pointer text-xs font-semibold">{k.replace('transport_','').replaceAll('_',' ')} — {added.length} added · {removed.length} removed · {changed.length} changed</summary>
+            {added.map(r=><p key={key(r)} className="text-xs text-emerald-700 dark:text-emerald-400 mt-2">Added: {context(r)} — {describe(r)}</p>)}
+            {removed.map(r=><p key={key(r)} className="text-xs text-red-600 mt-2">Removed: {context(r,true)} — {describe(r)}</p>)}
+            {changed.map(r=><div key={key(r)} className="text-xs mt-2"><strong>{context(r)} — Changed</strong>{Object.keys({...oldMap.get(key(r)),...r}).filter(f=>oldMap.get(key(r))?.[f]!==r[f]).map(f=><p key={f}>{f.replaceAll('_',' ')}: {String(oldMap.get(key(r))?.[f]??'—')} → {String(r[f]??'—')}</p>)}</div>)}
+          </details>;
+        })}
+        {snapshot.transport_stops.some(r=>!r.pin_url)&&<p className="text-xs text-amber-600">Some stops have no GPS link. Verify or correct them before publishing.</p>}
+        <div className="flex flex-wrap gap-2"><button className={button} onClick={()=>setReview(false)}>Back to editing</button><button className={button} onClick={()=>{if(original&&window.confirm('Discard all draft changes?')){setSnapshot(structuredClone(original));setRouteId(String(original.transport_routes[0]?.id??''));setDirty(false);setReview(false);setSourceFilename(null);}}}>Discard draft</button><button className={primary} onClick={()=>{if(window.confirm('Publish the reviewed schedule for '+(center==='dic'?'DIC':'Al Quoz')+'? Confirm that all changes and GPS links have been checked.'))publish();}}>Confirm & Publish</button></div>
+      </div>}
       <h3 className="font-bold">Backups</h3>{backups.length===0&&<p className="text-xs">No backups yet.</p>}{backups.map(b=><div key={b.id} className="flex justify-between items-center gap-2 text-xs"><span>{b.created_at} {b.source_filename||''}</span><button className={button} onClick={()=>{if(window.confirm('Restore this backup? Current published data will be backed up; unsaved edits will be discarded.'))publish(b.id);}}>Restore</button></div>)}
     </fieldset>}
     </>}
