@@ -48,6 +48,7 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
       const lib=await import(/* @vite-ignore */ url);
       lib.GlobalWorkerOptions.workerSrc='https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.mjs';
       doc=await lib.getDocument({data:await (await fetch(pdf.url)).arrayBuffer(),isEvalSupported:false}).promise;
+      const detectedCenters=new Set<CenterId>();
       const found=new Map<string,{code:string;title:string;stops:string[];pins:string[];times:{pickup:string[];eta:string;departure:string;notes:string}[];extraDepartures:string[];warnings:string[]}>();
       for(let n=1;n<=doc.numPages;n++){
         const page=await doc.getPage(n);
@@ -70,6 +71,10 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
               try{const u=new URL(pin);if(['maps.app.goo.gl','goo.gl','maps.google.com','www.google.com','google.com'].includes(u.hostname))current.pins.push(pin);}catch{}
             }
           }
+          // Identify the centre from the document's own centre/ETA headings, not its filename.
+          const heading=value.toUpperCase().replace(/[–—-]/g,' ').replace(/\s+/g,' ');
+          if(/\b(?:ECO\s*DRIVE\s+(?:DIC|DUBAI INDUSTRIAL CITY)|(?:DIC|DUBAI INDUSTRIAL CITY)\s+CENT(?:RE|ER)\s+TRANSPORTATION)\b/.test(heading))detectedCenters.add('dic');
+          if(/\b(?:ECO\s*DRIVE\s+AL\s*QUOZ|AL\s*QUOZ\s+CENT(?:RE|ER)\s+TRANSPORTATION)\b/.test(heading))detectedCenters.add('al_quoz');
           const match=value.match(/^ROUTE\s+(\d+)\s*[-–—]\s*(.+)$/i);
           if(!match){
             if(current && /PICKUP/i.test(value) && /DEPARTURE/i.test(value)){
@@ -110,6 +115,9 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
           current={code,title,stops:found.get(code)?.stops||[],pins:found.get(code)?.pins||[],times:found.get(code)?.times||[],extraDepartures:found.get(code)?.extraDepartures||[],warnings:found.get(code)?.warnings||[]};found.set(code,current);columns=[];previous=line;
         }
       }
+      if(detectedCenters.size!==1)throw new Error(detectedCenters.size?'PDF contains conflicting centre headings. Extraction blocked.':'Cannot verify the centre from PDF headings. Extraction blocked.');
+      const detected=[...detectedCenters][0];
+      if(detected!==center)throw new Error('Wrong centre: this PDF belongs to '+(detected==='dic'?'DIC Centre':'Al Quoz Centre')+'. Select the correct centre and upload again.');
       if(!found.size)throw new Error('No route headings found. Select a text-based schedule PDF.');
       setPdfRoutes([...found.values()].sort((a,b)=>Number(a.code.slice(6))-Number(b.code.slice(6))));
     }catch(e){setError(e instanceof Error?e.message:String(e));}
@@ -184,7 +192,7 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
         </label>
         {pdf&&<div className="space-y-2"><div className="flex flex-wrap items-center justify-between gap-2 text-xs"><span>{pdf.name}</span><div className="flex gap-2"><a href={pdf.url} target="_blank" rel="noopener noreferrer" className={button}>Open PDF</a><button className={button} onClick={()=>setPdf(null)}>Remove PDF</button></div></div><iframe title="Schedule PDF preview" src={pdf.url} className="w-full h-96 rounded-lg border border-slate-300 dark:border-slate-700"/></div>}
         {pdf&&<button className={primary} onClick={()=>void extractRoutes()}>Extract Schedule</button>}
-        {pdfRoutes.length>0&&<div className="space-y-2"><h4 className="font-bold text-sm">{pdfRoutes.length} routes found</h4>{pdfRoutes.map(r=><div key={r.code} className="text-xs border-b border-slate-200 dark:border-slate-800 py-2"><strong>{r.code}</strong> — {r.title}<div className="mt-2 pl-3 space-y-1">{r.stops.length?r.stops.map((name,i)=><p key={i}>{i+1}. {name}</p>):<p className="text-amber-600">Pickup columns could not be read — check PDF manually.</p>}</div><div className="mt-2 space-y-1"><strong>GPS links ({r.pins.length})</strong>{r.pins.map((pin,i)=><p key={i}><a className="text-emerald-600 underline break-all" href={pin} target="_blank" rel="noopener noreferrer">{i+1}. {pin}</a></p>)}<p className="text-amber-600">Verify each link against its stop in the PDF before assigning it. {r.pins.length!==r.stops.length?"Link and stop counts differ.":""}</p></div><div className="mt-3 overflow-x-auto"><strong>Schedule ({r.times.length} trips)</strong>{r.times.length>0&&<table className="w-full text-xs text-left"><thead><tr>{r.times[0].pickup.map((_,i)=><th key={i} className="p-1">{r.stops[i]||'Pickup '+(i+1)}</th>)}<th>ETA</th><th>Departure</th><th>Notes</th></tr></thead><tbody>{r.times.map((t,i)=><tr key={i} className="border-t">{t.pickup.map((v,j)=><td key={j} className="p-1">{v}</td>)}<td>{t.eta}</td><td>{t.departure}</td><td>{t.notes}</td></tr>)}</tbody></table>}{r.extraDepartures.map((v,i)=><p key={i}>Additional departure: {v}</p>)}{!r.times.length&&<p className="text-amber-600">No complete schedule rows extracted.</p>}{r.warnings.map((v,i)=><p key={i} className="text-amber-600">{v}</p>)}</div></div>)}</div>}
+        {pdfRoutes.length>0&&<div className="space-y-2"><p role="status" className="text-emerald-600 text-xs font-semibold">Centre verified: {center==='dic'?'DIC Centre':'Al Quoz Centre'}</p><h4 className="font-bold text-sm">{pdfRoutes.length} routes found</h4>{pdfRoutes.map(r=><div key={r.code} className="text-xs border-b border-slate-200 dark:border-slate-800 py-2"><strong>{r.code}</strong> — {r.title}<div className="mt-2 pl-3 space-y-1">{r.stops.length?r.stops.map((name,i)=><p key={i}>{i+1}. {name}</p>):<p className="text-amber-600">Pickup columns could not be read — check PDF manually.</p>}</div><div className="mt-2 space-y-1"><strong>GPS links ({r.pins.length})</strong>{r.pins.map((pin,i)=><p key={i}><a className="text-emerald-600 underline break-all" href={pin} target="_blank" rel="noopener noreferrer">{i+1}. {pin}</a></p>)}<p className="text-amber-600">Verify each link against its stop in the PDF before assigning it. {r.pins.length!==r.stops.length?"Link and stop counts differ.":""}</p></div><div className="mt-3 overflow-x-auto"><strong>Schedule ({r.times.length} trips)</strong>{r.times.length>0&&<table className="w-full text-xs text-left"><thead><tr>{r.times[0].pickup.map((_,i)=><th key={i} className="p-1">{r.stops[i]||'Pickup '+(i+1)}</th>)}<th>ETA</th><th>Departure</th><th>Notes</th></tr></thead><tbody>{r.times.map((t,i)=><tr key={i} className="border-t">{t.pickup.map((v,j)=><td key={j} className="p-1">{v}</td>)}<td>{t.eta}</td><td>{t.departure}</td><td>{t.notes}</td></tr>)}</tbody></table>}{r.extraDepartures.map((v,i)=><p key={i}>Additional departure: {v}</p>)}{!r.times.length&&<p className="text-amber-600">No complete schedule rows extracted.</p>}{r.warnings.map((v,i)=><p key={i} className="text-amber-600">{v}</p>)}</div></div>)}</div>}
         <p className="text-xs text-slate-500 dark:text-slate-400">Schedule extraction preview only. Verify the centre and route headings against the PDF. No schedule changes are saved.</p>
       </div>
       <div className="flex gap-2 flex-wrap"><select aria-label="Route" className={field+' max-w-md'} value={routeId} onChange={e=>setRouteId(e.target.value)}><option value="">Select route</option>{snapshot.transport_routes.map(r=><option key={String(r.id)} value={String(r.id)}>{r.route_code} — {r.title}</option>)}</select><button className={button} onClick={addRoute}>+ Route</button></div>
