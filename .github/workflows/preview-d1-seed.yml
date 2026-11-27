@@ -1,0 +1,106 @@
+name: Seed preview transportation data
+on:
+  push:
+    branches: [maplibre-migration]
+    paths: ['.github/workflows/preview-d1-seed.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: preview-d1-transport
+  cancel-in-progress: false
+jobs:
+  seed:
+    if: github.ref == 'refs/heads/maplibre-migration'
+    runs-on: ubuntu-latest
+    environment: preview
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Export current transport catalog
+        run: |
+          node <<'JS'
+          const fs = require('fs');
+          const vm = require('vm');
+          const source = fs.readFileSync('src/data/transportationData.ts','utf8')
+            .replace(/^import .*;$/gm,'')
+            .replace(/export const (\w+): \w+\[\] =/g,'const $1 =');
+          const data = vm.runInNewContext(source+'\nJSON.stringify(TRANSPORT_ROUTES)',{}, {timeout:1000});
+          fs.writeFileSync('/tmp/transport-seed.json',data);
+          JS
+      - name: Seed and verify preview only
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          python3 - <<'PY'
+          import os,json,urllib.request,re,sqlite3
+          account=os.environ['CF_ACCOUNT']
+          token=os.environ['CF_TOKEN']
+          assert re.fullmatch(r'[a-fA-F0-9]{32}',account) and token
+          db='a7351f8e-0ece-486e-8533-c3e987b6291c'
+          base=f'https://api.cloudflare.com/client/v4/accounts/{account}/d1/database/{db}'
+          def call(url,payload=None):
+              req=urllib.request.Request(url,data=None if payload is None else json.dumps(payload).encode(),headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'})
+              with urllib.request.urlopen(req,timeout=30) as response:
+                  result=json.load(response)
+              if not result.get('success'): raise RuntimeError('D1 request failed')
+              return result['result']
+          def query(sql,params=None):
+              payload={'sql':sql}
+              if params is not None: payload['params']=params
+              result=call(base+'/query',payload)
+              if not all(x.get('success') for x in result): raise RuntimeError('SQL failed')
+              return [r for x in result for r in x.get('results',[])]
+          meta=call(base)
+          assert meta['name']=='ecodrive-preview-db' and meta['uuid']==db
+          routes=json.load(open('/tmp/transport-seed.json'))
+          assert len(routes)==14 and sum(r['centerId']=='dic' for r in routes)==10
+          tables={k:[] for k in ['transport_routes','transport_stops','transport_trips','transport_stop_times','transport_departures']}
+          for r in routes:
+              rid=r['id']
+              tables['transport_routes'].append([rid,r['centerId'],r['routeCode'],r['title'],r['scheduleType'],r['capacity'],r['centerEtaName']])
+              ids={s['id'] for s in r['stops']}
+              for i,s in enumerate(r['stops']):
+                  tables['transport_stops'].append([s['id'],rid,s['name'],s['landmark'],s.get('pinUrl'),i])
+              pos=0
+              for i,t in enumerate(r['trips']):
+                  assert set(t['stopTimes'])==ids
+                  tables['transport_trips'].append([t['id'],rid,i,t['eta'],t['departure'],t.get('notes')])
+                  for sid,time in t['stopTimes'].items():
+                      tables['transport_stop_times'].append([rid,t['id'],sid,time])
+                  for part in t['departure'].split('/'):
+                      m=re.fullmatch(r'\s*(\d{1,2}:\d{2}[AP]M)(?:\s+(.*?))?\s*',part)
+                      assert m,part
+                      tables['transport_departures'].append([f'{rid}_departure_{pos}',rid,m[1],m[2],t.get('notes'),pos])
+                      pos+=1
+          cols={
+            'transport_routes':'id,center_id,route_code,title,schedule_type,capacity,center_eta_name',
+            'transport_stops':'id,route_id,name,landmark,pin_url,position',
+            'transport_trips':'id,route_id,position,eta,departure,notes',
+            'transport_stop_times':'route_id,trip_id,stop_id,pickup_time',
+            'transport_departures':'id,route_id,departure_time,destination,notes,position'}
+          # Validate all records against the actual schema locally before any remote writes.
+          local=sqlite3.connect(':memory:')
+          local.execute('PRAGMA foreign_keys=ON')
+          local.executescript(open('migrations/0003_transportation_schema.sql').read())
+          for table,rows in tables.items():
+              local.executemany(f'INSERT INTO {table} ({cols[table]}) VALUES ('+','.join('?' for _ in rows[0])+')',rows)
+          # Refuse to seed over existing data, including a previous successful import.
+          for table in tables:
+              if query(f'SELECT COUNT(*) AS n FROM {table}')[0]['n']:
+                  raise SystemExit('Existing transport data found; refusing to overwrite')
+          for table,rows in tables.items():
+              width=len(rows[0])
+              chunk=90//width
+              for i in range(0,len(rows),chunk):
+                  batch=rows[i:i+chunk]
+                  sql=f'INSERT INTO {table} ({cols[table]}) VALUES '+','.join('('+','.join('?' for _ in row)+')' for row in batch)
+                  query(sql,[v for row in batch for v in row])
+              actual=query(f'SELECT {cols[table]} FROM {table}')
+              expected=sorted(json.dumps(row,ensure_ascii=False) for row in rows)
+              observed=sorted(json.dumps([row[c] for c in cols[table].split(',')],ensure_ascii=False) for row in actual)
+              assert expected==observed,table
+              print(f'{table}: {len(rows)} records verified')
+          print('Preview seed verified; coordinates remain unset pending verified pin resolution.')
+          PY
