@@ -1,3 +1,4 @@
+import { getTripReturnDepartures, formatReturnDeparture } from '../types/transportation';
 import React, { useState, useMemo, useRef, useEffect } from 'react';
 import {
   Bus,
@@ -1008,16 +1009,6 @@ const RouteScheduleCard: React.FC<RouteScheduleCardProps> = ({
         </div>
       </div>
 
-      {route.departures && (
-        <div className="px-4 py-3 border-t border-slate-200 dark:border-slate-800">
-          <h3 className="text-sm font-bold mb-2">Official centre departures</h3>
-          <div className="flex flex-wrap gap-2">
-            {route.departures.map(d => <span key={d.id} className="rounded-lg bg-emerald-50 dark:bg-emerald-950 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-200">{d.time}{d.destination ? ' · ' + d.destination : ''}</span>)}
-            {!route.departures.length && <span className="text-xs">No centre departures scheduled.</span>}
-          </div>
-        </div>
-      )}
-
       {/* Schedule Table */}
       <div className="overflow-x-auto">
         <table className="w-full text-left text-xs">
@@ -1098,7 +1089,7 @@ const RouteScheduleCard: React.FC<RouteScheduleCardProps> = ({
                   <td className="py-3 px-4 bg-[#F0FDF4]/50 dark:bg-emerald-950/20 font-bold text-[#064E3B] dark:text-emerald-200">
                     <div className="flex flex-col">
                       <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-[#006B45] text-white text-xs w-max shadow-2xs">
-                        {route.departures ? 'See centre departures above' : trip.departure}
+                        {route.departures ? (getTripReturnDepartures(route, trip).map(formatReturnDeparture).join(' / ') || '—') : trip.departure}
                       </span>
                       {!route.departures && trip.notes && (
                         <span className="text-[10px] text-[#059669] dark:text-emerald-400 font-medium mt-1">
@@ -1110,6 +1101,14 @@ const RouteScheduleCard: React.FC<RouteScheduleCardProps> = ({
                 </tr>
               );
             })}
+            {route.departures?.filter(d => !route.trips.some(trip => getTripReturnDepartures(route, trip).some(match => match.id === d.id))).map(d => (
+              <tr key={d.id} className="bg-emerald-50/50 dark:bg-emerald-950/20">
+                <td className="py-3 px-4 text-center">—</td>
+                {route.stops.map(stop => <td key={stop.id} className="py-3 px-4">—</td>)}
+                <td className="py-3 px-4">—</td>
+                <td className="py-3 px-4 font-bold text-emerald-700 dark:text-emerald-200">{formatReturnDeparture(d)}</td>
+              </tr>
+            ))}
           </tbody>
         </table>
       </div>
