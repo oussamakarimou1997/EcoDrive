@@ -170,9 +170,46 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
   });
   const publish=(backupId?:string)=>auth.requireAdminAuthorization(backupId?'Restore transportation backup':'Publish transportation schedule',async token=>{
     setBusy(true);setError('');
-    try{await request(base+(backupId?'/restore':''),token,backupId?'POST':'PUT',backupId?{revision,backupId}:{revision,snapshot});window.location.reload();}
+    try{await request(base+(backupId?'/restore':''),token,backupId?'POST':'PUT',backupId?{revision,backupId}:{revision,snapshot,sourceFilename});window.location.reload();}
     catch(e){setError(e instanceof Error?e.message:String(e));setBusy(false);}
   });
+  const [sourceFilename,setSourceFilename]=useState<string|null>(null);
+  useEffect(()=>{setSourceFilename(null);},[center,auth.isAuthorized]);
+  function importPdfDraft(){
+    if(!snapshot||!pdf||!pdfRoutes.length)return;
+    setError('');
+    try{
+      if(pdfRoutes.some(r=>!r.stops.length||!r.times.length||r.warnings.length||r.times.some(t=>t.pickup.length!==r.stops.length)))throw new Error('Incomplete or unresolved PDF rows. Correct extraction before importing.');
+      if(!window.confirm('Replace the selected centre draft with extracted routes? Published schedules will not change until Publish.'))return;
+      const draft:TransportSnapshot={transport_routes:[],transport_stops:[],transport_trips:[],transport_stop_times:[],transport_departures:[]};
+      const normalize=(v:unknown)=>String(v??'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+      for(const r of pdfRoutes){
+        const old=snapshot.transport_routes.find(x=>normalize(x.route_code)===normalize(r.code));
+        if(!old)throw new Error('New route '+r.code+' requires capacity and schedule type verification. Import blocked.');
+        const id=String(old.id);
+        draft.transport_routes.push({...old,title:r.title,active:1});
+        const stops=r.stops.map((name,position)=>{
+          const matches=snapshot.transport_stops.filter(x=>x.route_id===id&&normalize(x.name)===normalize(name));
+          const prior=matches.length===1?matches[0]:null;
+          return {id:prior?.id??uid(),route_id:id,name,landmark:prior?.landmark??'',pin_url:prior?.pin_url&&r.pins.includes(String(prior.pin_url))?prior.pin_url:null,latitude:prior?.pin_url&&r.pins.includes(String(prior.pin_url))?prior.latitude:null,longitude:prior?.pin_url&&r.pins.includes(String(prior.pin_url))?prior.longitude:null,position,active:1};
+        });
+        draft.transport_stops.push(...stops);
+        let departurePosition=0;
+        for(const [position,t] of r.times.entries()){
+          const tripId=uid();
+          draft.transport_trips.push({id:tripId,route_id:id,position,eta:t.eta,departure:t.departure,notes:t.notes||null,active:1});
+          stops.forEach((stop,i)=>draft.transport_stop_times.push({route_id:id,trip_id:tripId,stop_id:stop.id,pickup_time:t.pickup[i]}));
+          draft.transport_departures.push({id:uid(),route_id:id,departure_time:t.departure,destination:null,notes:t.notes||null,position:departurePosition++,active:1});
+        }
+        for(const extra of r.extraDepartures){
+          const m=extra.match(/^\s*((?:0?[1-9]|1[0-2]):[0-5]\d\s*[AP]M)\s*(.*)$/i);
+          if(!m)throw new Error('Unresolved additional departure in '+r.code);
+          draft.transport_departures.push({id:uid(),route_id:id,departure_time:m[1].replace(/\s/g,'').toUpperCase(),destination:null,notes:m[2]||null,position:departurePosition++,active:1});
+        }
+      }
+      setSnapshot(draft);setRouteId(String(draft.transport_routes[0].id));setDirty(true);setReview(false);setSourceFilename(pdf.name);
+    }catch(e){setError(e instanceof Error?e.message:String(e));}
+  }
   const route=snapshot?.transport_routes.find(r=>r.id===routeId);
   const rows=(table:string)=>snapshot?.[table].map((row,index)=>({row,index})).filter(x=>x.row.route_id===routeId)||[];
   const edit=(table:string,index:number,row:TransportRow,key:string,numeric=false)=><label key={key} className="text-xs space-y-1"><span>{key.replaceAll('_',' ')}</span><input className={field} type={numeric?'number':'text'} value={row[key]??''} onChange={e=>update(table,index,key,numeric?(e.target.value===''?null:Number(e.target.value)):(e.target.value===''&&row[key]===null?null:e.target.value))}/></label>;
@@ -192,7 +229,7 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
         </label>
         {pdf&&<div className="space-y-2"><div className="flex flex-wrap items-center justify-between gap-2 text-xs"><span>{pdf.name}</span><div className="flex gap-2"><a href={pdf.url} target="_blank" rel="noopener noreferrer" className={button}>Open PDF</a><button className={button} onClick={()=>setPdf(null)}>Remove PDF</button></div></div><iframe title="Schedule PDF preview" src={pdf.url} className="w-full h-96 rounded-lg border border-slate-300 dark:border-slate-700"/></div>}
         {pdf&&<button className={primary} onClick={()=>void extractRoutes()}>Extract Schedule</button>}
-        {pdfRoutes.length>0&&<div className="space-y-2"><p role="status" className="text-emerald-600 text-xs font-semibold">Centre verified: {center==='dic'?'DIC Centre':'Al Quoz Centre'}</p><h4 className="font-bold text-sm">{pdfRoutes.length} routes found</h4>{pdfRoutes.map(r=><div key={r.code} className="text-xs border-b border-slate-200 dark:border-slate-800 py-2"><strong>{r.code}</strong> — {r.title}<div className="mt-2 pl-3 space-y-1">{r.stops.length?r.stops.map((name,i)=><p key={i}>{i+1}. {name}</p>):<p className="text-amber-600">Pickup columns could not be read — check PDF manually.</p>}</div><div className="mt-2 space-y-1"><strong>GPS links ({r.pins.length})</strong>{r.pins.map((pin,i)=><p key={i}><a className="text-emerald-600 underline break-all" href={pin} target="_blank" rel="noopener noreferrer">{i+1}. {pin}</a></p>)}<p className="text-amber-600">Verify each link against its stop in the PDF before assigning it. {r.pins.length!==r.stops.length?"Link and stop counts differ.":""}</p></div><div className="mt-3 overflow-x-auto"><strong>Schedule ({r.times.length} trips)</strong>{r.times.length>0&&<table className="w-full text-xs text-left"><thead><tr>{r.times[0].pickup.map((_,i)=><th key={i} className="p-1">{r.stops[i]||'Pickup '+(i+1)}</th>)}<th>ETA</th><th>Departure</th><th>Notes</th></tr></thead><tbody>{r.times.map((t,i)=><tr key={i} className="border-t">{t.pickup.map((v,j)=><td key={j} className="p-1">{v}</td>)}<td>{t.eta}</td><td>{t.departure}</td><td>{t.notes}</td></tr>)}</tbody></table>}{r.extraDepartures.map((v,i)=><p key={i}>Additional departure: {v}</p>)}{!r.times.length&&<p className="text-amber-600">No complete schedule rows extracted.</p>}{r.warnings.map((v,i)=><p key={i} className="text-amber-600">{v}</p>)}</div></div>)}</div>}
+        {pdfRoutes.length>0&&<div className="space-y-2"><button className={primary} onClick={importPdfDraft}>Import into draft</button><p className="text-xs text-amber-600">Verify all routes, stops, times and GPS links before importing. Unmatched GPS links must be assigned manually. Missing routes will be removed from the draft.</p><p role="status" className="text-emerald-600 text-xs font-semibold">Centre verified: {center==='dic'?'DIC Centre':'Al Quoz Centre'}</p><h4 className="font-bold text-sm">{pdfRoutes.length} routes found</h4>{pdfRoutes.map(r=><div key={r.code} className="text-xs border-b border-slate-200 dark:border-slate-800 py-2"><strong>{r.code}</strong> — {r.title}<div className="mt-2 pl-3 space-y-1">{r.stops.length?r.stops.map((name,i)=><p key={i}>{i+1}. {name}</p>):<p className="text-amber-600">Pickup columns could not be read — check PDF manually.</p>}</div><div className="mt-2 space-y-1"><strong>GPS links ({r.pins.length})</strong>{r.pins.map((pin,i)=><p key={i}><a className="text-emerald-600 underline break-all" href={pin} target="_blank" rel="noopener noreferrer">{i+1}. {pin}</a></p>)}<p className="text-amber-600">Verify each link against its stop in the PDF before assigning it. {r.pins.length!==r.stops.length?"Link and stop counts differ.":""}</p></div><div className="mt-3 overflow-x-auto"><strong>Schedule ({r.times.length} trips)</strong>{r.times.length>0&&<table className="w-full text-xs text-left"><thead><tr>{r.times[0].pickup.map((_,i)=><th key={i} className="p-1">{r.stops[i]||'Pickup '+(i+1)}</th>)}<th>ETA</th><th>Departure</th><th>Notes</th></tr></thead><tbody>{r.times.map((t,i)=><tr key={i} className="border-t">{t.pickup.map((v,j)=><td key={j} className="p-1">{v}</td>)}<td>{t.eta}</td><td>{t.departure}</td><td>{t.notes}</td></tr>)}</tbody></table>}{r.extraDepartures.map((v,i)=><p key={i}>Additional departure: {v}</p>)}{!r.times.length&&<p className="text-amber-600">No complete schedule rows extracted.</p>}{r.warnings.map((v,i)=><p key={i} className="text-amber-600">{v}</p>)}</div></div>)}</div>}
         <p className="text-xs text-slate-500 dark:text-slate-400">Schedule extraction preview only. Verify the centre and route headings against the PDF. No schedule changes are saved.</p>
       </div>
       <div className="flex gap-2 flex-wrap"><select aria-label="Route" className={field+' max-w-md'} value={routeId} onChange={e=>setRouteId(e.target.value)}><option value="">Select route</option>{snapshot.transport_routes.map(r=><option key={String(r.id)} value={String(r.id)}>{r.route_code} — {r.title}</option>)}</select><button className={button} onClick={addRoute}>+ Route</button></div>
@@ -206,7 +243,7 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
       {rows('transport_departures').map(({row,index})=><div key={String(row.id)} className="grid grid-cols-2 md:grid-cols-4 gap-2">{['departure_time','destination','notes','position'].map(k=>edit('transport_departures',index,row,k,k==='position'))}<button className={button+' text-red-600'} onClick={()=>remove('transport_departures',row)}>Remove departure</button></div>)}
       </>}
       <div className="flex gap-2"><button className={primary} disabled={!dirty} onClick={()=>setReview(true)}>Review changes</button></div>
-      {review&&<div className="border rounded-xl p-3 space-y-2"><h3 className="font-bold">Review before publish</h3>{Object.keys(snapshot).map(k=>{const before=original?.[k]||[];const after=snapshot[k];return <p key={k} className="text-xs">{k.replace('transport_','').replaceAll('_',' ')}: {before.length} → {after.length} rows; {after.filter(r=>!before.some(b=>JSON.stringify(b)===JSON.stringify(r))).length} new or changed</p>;})}<button className={primary} onClick={()=>publish()}>Publish</button></div>}
+      {review&&<div className="border rounded-xl p-3 space-y-2"><h3 className="font-bold">Review before publish</h3>{sourceFilename&&<p className="text-xs text-amber-600">Imported from {sourceFilename}. Verify every stop, GPS link, departure and removed route before publishing.</p>}{Object.keys(snapshot).map(k=>{const before=original?.[k]||[];const after=snapshot[k];return <p key={k} className="text-xs">{k.replace('transport_','').replaceAll('_',' ')}: {before.length} → {after.length} rows; {after.filter(r=>!before.some(b=>JSON.stringify(b)===JSON.stringify(r))).length} new or changed</p>;})}<button className={primary} onClick={()=>publish()}>Publish</button></div>}
       <h3 className="font-bold">Backups</h3>{backups.length===0&&<p className="text-xs">No backups yet.</p>}{backups.map(b=><div key={b.id} className="flex justify-between items-center gap-2 text-xs"><span>{b.created_at} {b.source_filename||''}</span><button className={button} onClick={()=>{if(window.confirm('Restore this backup? Current published data will be backed up; unsaved edits will be discarded.'))publish(b.id);}}>Restore</button></div>)}
     </fieldset>}
     </>}
