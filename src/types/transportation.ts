@@ -52,13 +52,15 @@ export function getTripReturnDepartures(route: TransportRoute, trip: TransportTr
 export function formatReturnDeparture(d: NonNullable<TransportRoute['departures']>[number]) {
   // Legacy notes can repeat the entire evening departure list on each row.
   // Keep explicit destinations; strip only time-only lists from display notes.
-  const note = (d.notes || '').trim();
+  const note = (d.notes || '').trim().replace(/\s+/g, ' ');
   const timeList = /^\d{1,2}:\d{2}\s*[AP]M(?:\s*(?:&|\/|,|AND)\s*\d{1,2}:\d{2}\s*[AP]M)*$/i;
   const legacyExpo = /^(\d{1,2}:\d{2}\s*[AP]M)\s+DROP OFF TO EXPO METRO\s*&\s*\d{1,2}:\d{2}\s*[AP]M$/i.exec(note);
   const normalized = (time: string) => time.toUpperCase().replace(/\s/g, '');
   const displayNote = legacyExpo
     ? (normalized(legacyExpo[1]) === normalized(d.time) ? 'DROP OFF TO EXPO METRO' : '')
     : (timeList.test(note) ? '' : note);
-  const detail = d.destination?.trim() || displayNote;
+  const destination = (d.destination || '').trim().replace(/\s+/g, ' ');
+  const legacyDestination = /^\d{1,2}:\d{2}\s*[AP]M\s+DROP OFF TO EXPO METRO\s*&\s*\d{1,2}:\d{2}\s*[AP]M$/i.test(destination);
+  const detail = (legacyDestination || timeList.test(destination) ? '' : destination) || displayNote;
   return [d.time, detail].filter(Boolean).join(' · ');
 }
