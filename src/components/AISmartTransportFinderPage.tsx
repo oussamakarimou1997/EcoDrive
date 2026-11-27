@@ -283,7 +283,7 @@ const AISmartTransportFinderContent: React.FC = () => {
   }, [primaryResult, selectedBranch, allStations]);
 
   const additionalReturnDepartures = TRANSPORT_ROUTES
-    .filter(route => route.centerId === selectedBranch && sameRouteLines.some(line => line.routeId === route.id))
+    .filter(route => selectedBranch && route.centerId === BRANCH_META[selectedBranch].centerId && sameRouteLines.some(line => line.routeId === route.id))
     .flatMap(route => (route.departures || [])
       .filter(departure => !route.trips.some(trip => getTripReturnDepartures(route, trip).some(match => match.id === departure.id)))
       .map(departure => ({ key: route.id + ':' + departure.id, routeCode: route.routeCode, label: formatReturnDeparture(departure) })));
