@@ -566,11 +566,129 @@ STRICT ACCURACY & GROUNDING RULES:
 // ---------------------------------------------------------------------------
 // Main Cloudflare Worker Router
 // ---------------------------------------------------------------------------
+
+class TransportInputError extends Error {}
+async function transportRevision(snapshot:string):Promise<string> {
+  return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(snapshot)))).map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+function validateTransportSnapshot(input:unknown,center:string,specs:string[][]):Record<string,Record<string,unknown>[]> {
+  const fail = (message:string):never => { throw new TransportInputError(message); };
+  if (!input || typeof input!=='object' || Array.isArray(input)) fail('Invalid snapshot');
+  const data = input as Record<string,Record<string,unknown>[]>;
+  const str = (v:unknown,max=500) => typeof v==='string' && v.trim().length>0 && v.length<=max;
+  const id = (v:unknown) => typeof v==='string' && /^[a-zA-Z0-9_-]{1,100}$/.test(v);
+  const time = (v:unknown) => typeof v==='string' && /^(?:[1-9]|0[1-9]|1[0-2]):[0-5][0-9][AP]M$/.test(v);
+  const optional = (v:unknown) => v===null || (typeof v==='string' && v.length<=1000);
+  const integer = (v:unknown,min:number,max:number) => typeof v==='number' && Number.isInteger(v) && v>=min && v<=max;
+  for (const [table,cols] of specs) {
+    if (!Array.isArray(data[table]) || data[table].length>3000) fail('Invalid '+table);
+    const keys = cols.split(',');
+    const seen = new Set<string>();
+    for (const row of data[table]) {
+      if (!row || typeof row!=='object' || keys.some(k=>!Object.prototype.hasOwnProperty.call(row,k))) fail('Missing fields in '+table);
+      const key = table==='transport_stop_times'?JSON.stringify([row.trip_id,row.stop_id]):String(row.id);
+      if (seen.has(key)) fail('Duplicate identifier in '+table);
+      seen.add(key);
+      if (table!=='transport_stop_times' && (!id(row.id) || !integer(row.active,0,1))) fail('Invalid identifier or active flag');
+      if (table!=='transport_routes' && !id(row.route_id)) fail('Invalid route identifier');
+      if ('position' in row && !integer(row.position,0,3000)) fail('Invalid position');
+    }
+  }
+  const routes = new Map(data.transport_routes.map(r=>[r.id,r]));
+  const stops = new Map(data.transport_stops.map(r=>[r.id,r]));
+  const trips = new Map(data.transport_trips.map(r=>[r.id,r]));
+  if (!data.transport_routes.some(r=>r.active===1)) fail('At least one active route required');
+  for (const r of data.transport_routes) {
+    if (r.center_id!==center || !str(r.route_code,100) || !str(r.title) || !str(r.schedule_type) || !str(r.center_eta_name) || !integer(r.capacity,1,500)) fail('Invalid route');
+  }
+  for (const [table] of specs.slice(1)) for (const r of data[table]) if (!routes.has(r.route_id)) fail('Unknown route');
+  for (const s of data.transport_stops) {
+    if (!str(s.name) || typeof s.landmark!=='string' || s.landmark.length>1000 || !optional(s.pin_url)) fail('Invalid stop');
+    if (s.pin_url!==null) {
+      try { if (new URL(String(s.pin_url)).protocol!=='https:') fail('Invalid map link'); } catch { fail('Invalid map link'); }
+    }
+    if (!(s.latitude===null && s.longitude===null) && !(typeof s.latitude==='number' && Math.abs(s.latitude)<=90 && typeof s.longitude==='number' && Math.abs(s.longitude)<=180)) fail('Invalid coordinates');
+  }
+  for (const t of data.transport_trips) if (!(t.eta===null || time(t.eta)) || !optional(t.departure) || !optional(t.notes)) fail('Invalid trip');
+  for (const t of data.transport_stop_times) if (!time(t.pickup_time) || stops.get(t.stop_id)?.route_id!==t.route_id || trips.get(t.trip_id)?.route_id!==t.route_id) fail('Invalid pickup time or reference');
+  for (const d of data.transport_departures) if (!time(d.departure_time) || !optional(d.destination) || !optional(d.notes)) fail('Invalid departure');
+  for (const r of data.transport_routes.filter(r=>r.active===1)) {
+    const ss=data.transport_stops.filter(s=>s.route_id===r.id && s.active===1);
+    const tt=data.transport_trips.filter(t=>t.route_id===r.id && t.active===1);
+    if (!ss.length || !tt.length) fail('Active route requires stops and trips');
+    for (const t of tt) for (const s of ss) if (!data.transport_stop_times.some(x=>x.trip_id===t.id && x.stop_id===s.id)) fail('Missing pickup time');
+  }
+  return data;
+}
+
 async function handleApiRequest(request: Request, env: Env, url: URL): Promise<Response> {
   const { pathname } = url;
   const method = request.method.toUpperCase();
 
   try {
+
+    // Admin-only center replacement and rollback; D1 batch is transactional.
+    const transportWrite = pathname.match(/^\/api\/transport\/admin\/(dic|al_quoz)(?:\/(backups|restore))?$/);
+    if (transportWrite) {
+      const authError = await requireAdminAuth(request, env);
+      if (authError) return authError;
+      const center = transportWrite[1];
+      const action = transportWrite[2];
+      const specs = [
+        ['transport_routes','id,center_id,route_code,title,schedule_type,capacity,center_eta_name,active'],
+        ['transport_stops','id,route_id,name,landmark,pin_url,latitude,longitude,position,active'],
+        ['transport_trips','id,route_id,position,eta,departure,notes,active'],
+        ['transport_stop_times','route_id,trip_id,stop_id,pickup_time'],
+        ['transport_departures','id,route_id,departure_time,destination,notes,position,active'],
+      ];
+      const scope = (i: number) => i === 0 ? 'center_id=?' : 'route_id IN (SELECT id FROM transport_routes WHERE center_id=?)';
+      // A single SQL expression captures a consistent snapshot, also used for optimistic concurrency.
+      const snapshotSql = "SELECT json_object(" + specs.map(([table,cols],i) =>
+        "'" + table + "',json(COALESCE((SELECT json_group_array(json(row_json)) FROM (SELECT json_object(" +
+        cols.split(',').map(c => "'" + c + "'," + c).join(',') +
+        ") AS row_json FROM " + table + " WHERE " + scope(i) + " ORDER BY " + (i===3?'trip_id,stop_id':'id') + ")), '[]'))"
+      ).join(',') + ") AS snapshot";
+      try {
+        if (method === 'GET' && action === 'backups') {
+          const result = await env.DB.prepare('SELECT id,created_at,source_filename FROM transport_backups WHERE center_id=? ORDER BY created_at DESC,id DESC LIMIT 50').bind(center).all();
+          return jsonResponse({ backups: result.results });
+        }
+        if (method === 'GET' && !action) {
+          const row = await env.DB.prepare(snapshotSql).bind(...specs.map(()=>center)).first<{snapshot:string}>();
+          return jsonResponse({ snapshot: JSON.parse(row!.snapshot), revision: await transportRevision(row!.snapshot) });
+        }
+        if (!(method === 'PUT' && !action) && !(method === 'POST' && action === 'restore')) return jsonResponse({error:'Method not allowed'},405);
+        const body = await readJsonBody<{snapshot?:unknown;revision?:string;backupId?:string;sourceFilename?:string}>(request);
+        const current = await env.DB.prepare(snapshotSql).bind(...specs.map(()=>center)).first<{snapshot:string}>();
+        if (!current || body.revision !== await transportRevision(current.snapshot)) return jsonResponse({error:'Catalog changed; reload before publishing.'},409);
+        let incoming = body.snapshot;
+        if (action === 'restore') {
+          const backup = await env.DB.prepare('SELECT snapshot_json FROM transport_backups WHERE center_id=? AND id=?').bind(center,body.backupId || '').first<{snapshot_json:string}>();
+          if (!backup) return jsonResponse({error:'Backup not found'},404);
+          incoming = JSON.parse(backup.snapshot_json);
+        }
+        const data = validateTransportSnapshot(incoming,center,specs);
+        const serialized = JSON.stringify(data);
+        if (new TextEncoder().encode(serialized).length > 250000) return jsonResponse({error:'Catalog too large'},413);
+        const backupId = crypto.randomUUID();
+        const statements = [
+          // Invalid JSON violates the backup CHECK if another writer changed the snapshot.
+          env.DB.prepare("INSERT INTO transport_backups(id,center_id,source_filename,snapshot_json) SELECT ?,?,?,CASE WHEN snapshot=? THEN snapshot ELSE 'conflict' END FROM ("+snapshotSql+")")
+            .bind(backupId,center,typeof body.sourceFilename==='string'?body.sourceFilename.slice(0,200):null,current.snapshot,...specs.map(()=>center)),
+          ...specs.map((_,i)=>i).reverse().map(i=>env.DB.prepare('DELETE FROM '+specs[i][0]+' WHERE '+scope(i)).bind(center)),
+          ...specs.map(([table,cols])=>env.DB.prepare('INSERT INTO '+table+' ('+cols+') SELECT '+cols.split(',').map(c=>"json_extract(value,'$."+c+"')").join(',')+' FROM json_each(?)').bind(JSON.stringify(data[table]))),
+        ];
+        const results = await env.DB.batch(statements);
+        if (!results.every(x=>x.success)) throw new Error('Publish failed');
+        return jsonResponse({published:true,backupId,center});
+      } catch (err) {
+        if (err instanceof BadJsonError) return jsonResponse({error:err.message},err.status);
+        if (err instanceof TransportInputError) return jsonResponse({error:err.message},400);
+        console.error('Transport admin operation failed',err);
+        return jsonResponse({error:'Transportation operation failed; reload before retrying.'},500);
+      }
+    }
+
     // Read-only transportation catalog. Existing frontend remains unchanged.
     if (pathname === '/api/transport/catalog' && method === 'GET') {
       const center = url.searchParams.get('center');
