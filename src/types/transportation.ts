@@ -54,6 +54,11 @@ export function formatReturnDeparture(d: NonNullable<TransportRoute['departures'
   // Keep explicit destinations; strip only time-only lists from display notes.
   const note = (d.notes || '').trim();
   const timeList = /^\d{1,2}:\d{2}\s*[AP]M(?:\s*(?:&|\/|,|AND)\s*\d{1,2}:\d{2}\s*[AP]M)*$/i;
-  const detail = d.destination?.trim() || (timeList.test(note) ? '' : note);
+  const legacyExpo = /^(\d{1,2}:\d{2}\s*[AP]M)\s+DROP OFF TO EXPO METRO\s*&\s*\d{1,2}:\d{2}\s*[AP]M$/i.exec(note);
+  const normalized = (time: string) => time.toUpperCase().replace(/\s/g, '');
+  const displayNote = legacyExpo
+    ? (normalized(legacyExpo[1]) === normalized(d.time) ? 'DROP OFF TO EXPO METRO' : '')
+    : (timeList.test(note) ? '' : note);
+  const detail = d.destination?.trim() || displayNote;
   return [d.time, detail].filter(Boolean).join(' · ');
 }
