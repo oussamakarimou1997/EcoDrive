@@ -571,6 +571,55 @@ async function handleApiRequest(request: Request, env: Env, url: URL): Promise<R
   const method = request.method.toUpperCase();
 
   try {
+    // Read-only transportation catalog. Existing frontend remains unchanged.
+    if (pathname === '/api/transport/catalog' && method === 'GET') {
+      const center = url.searchParams.get('center');
+      if (center !== null && center !== 'dic' && center !== 'al_quoz') {
+        return jsonResponse({ error: 'Invalid transportation center.' }, 400);
+      }
+      try {
+        const [centers, routes, stops, trips, times, departures] = await env.DB.batch<Record<string, unknown>>([
+          env.DB.prepare('SELECT id, name FROM transport_centers ORDER BY id'),
+          env.DB.prepare('SELECT * FROM transport_routes WHERE active=1 ORDER BY center_id, CAST(substr(route_code,7) AS INTEGER), id'),
+          env.DB.prepare('SELECT * FROM transport_stops WHERE active=1 ORDER BY position,id'),
+          env.DB.prepare('SELECT * FROM transport_trips WHERE active=1 ORDER BY position,id'),
+          env.DB.prepare('SELECT * FROM transport_stop_times'),
+          env.DB.prepare('SELECT * FROM transport_departures WHERE active=1 ORDER BY position,id'),
+        ]);
+        if (![centers,routes,stops,trips,times,departures].every(r => r.success)) {
+          throw new Error('Transport catalog query failed');
+        }
+        const selected = routes.results.filter(r => !center || r.center_id === center);
+        if (!selected.length) return jsonResponse({ error: 'Transportation catalog unavailable.' }, 503);
+        return jsonResponse({
+          centers: centers.results.filter(c => !center || c.id === center),
+          routes: selected.map(r => {
+            const routeStops = stops.results.filter(s => s.route_id === r.id);
+            const stopIds = new Set(routeStops.map(s => s.id));
+            return {
+              id:r.id, centerId:r.center_id, routeCode:r.route_code,
+              title:r.title, scheduleType:r.schedule_type, capacity:r.capacity,
+              centerEtaName:r.center_eta_name,
+              stops:routeStops.map(s => ({
+                id:s.id, name:s.name, landmark:s.landmark, pinUrl:s.pin_url ?? undefined,
+                latitude:s.latitude, longitude:s.longitude,
+              })),
+              trips:trips.results.filter(t => t.route_id === r.id).map(t => ({
+                id:t.id, eta:t.eta, departure:t.departure, notes:t.notes ?? undefined,
+                stopTimes:Object.fromEntries(times.results.filter(x => x.route_id === r.id && x.trip_id === t.id && stopIds.has(x.stop_id)).map(x => [String(x.stop_id),x.pickup_time])),
+              })),
+              departures:departures.results.filter(d => d.route_id === r.id).map(d => ({
+                id:d.id, time:d.departure_time, destination:d.destination, notes:d.notes,
+              })),
+            };
+          }),
+        });
+      } catch (err) {
+        console.error('Transport catalog read failed:', err);
+        return jsonResponse({ error: 'Unable to load transportation catalog.' }, 503);
+      }
+    }
+
     // 1. Transportation & Google Maps Routes
     if (pathname === '/api/maps/walking-route' && method === 'POST') {
       return handleOpenWalkingRoute(request, env.ORS_API_KEY);
