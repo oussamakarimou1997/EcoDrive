@@ -50,5 +50,10 @@ export function getTripReturnDepartures(route: TransportRoute, trip: TransportTr
   return (route.departures || []).filter(d => d.time.toUpperCase().replace(/\s/g, '') === first);
 }
 export function formatReturnDeparture(d: NonNullable<TransportRoute['departures']>[number]) {
-  return [d.time, d.destination || d.notes].filter(Boolean).join(' · ');
+  // Legacy notes can repeat the entire evening departure list on each row.
+  // Keep explicit destinations; strip only time-only lists from display notes.
+  const note = (d.notes || '').trim();
+  const timeList = /^\d{1,2}:\d{2}\s*[AP]M(?:\s*(?:&|\/|,|AND)\s*\d{1,2}:\d{2}\s*[AP]M)*$/i;
+  const detail = d.destination?.trim() || (timeList.test(note) ? '' : note);
+  return [d.time, detail].filter(Boolean).join(' · ');
 }
