@@ -35,6 +35,17 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
   const [dirty,setDirty]=useState(false);
   const [routeId,setRouteId]=useState('');
   const [review,setReview]=useState(false);
+  const [pdf,setPdf]=useState<{name:string;url:string}|null>(null);
+  useEffect(()=>()=>{if(pdf)URL.revokeObjectURL(pdf.url);},[pdf]);
+  useEffect(()=>{setPdf(null);},[center,auth.isAuthorized]);
+  async function selectPdf(file:File|undefined){
+    if(!file)return;
+    setError('');
+    if(file.size>20*1024*1024){setError('PDF must be smaller than 20 MB.');return;}
+    const signature=await file.slice(0,5).text();
+    if(signature!=='%PDF-'){setError('Please select a valid PDF file.');return;}
+    setPdf({name:file.name,url:URL.createObjectURL(file)});
+  }
   const [original,setOriginal]=useState<TransportSnapshot|null>(null);
   const base='/api/transport/admin/'+center;
   const field='w-full min-w-24 rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-2 py-1.5 text-xs';
@@ -86,6 +97,15 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
     {busy&&<p role="status" className="text-sm">Loading…</p>}
     {!snapshot&&!busy&&<button className={button} onClick={()=>auth.requireAdminAuthorization('Load schedules',load)}>Retry</button>}
     {snapshot&&<fieldset disabled={busy} className="space-y-4">
+      <div className="rounded-xl border border-dashed border-emerald-600/50 p-4 space-y-3">
+        <h3 className="font-bold">Upload Schedule PDF</h3>
+        <label className="inline-block cursor-pointer rounded-lg bg-[#064E3B] text-white px-4 py-2 text-xs font-semibold">
+          Choose PDF
+          <input type="file" accept=".pdf,application/pdf" className="sr-only" onChange={e=>{void selectPdf(e.target.files?.[0]);e.target.value='';}}/>
+        </label>
+        {pdf&&<div className="space-y-2"><div className="flex flex-wrap items-center justify-between gap-2 text-xs"><span>{pdf.name}</span><div className="flex gap-2"><a href={pdf.url} target="_blank" rel="noopener noreferrer" className={button}>Open PDF</a><button className={button} onClick={()=>setPdf(null)}>Remove PDF</button></div></div><iframe title="Schedule PDF preview" src={pdf.url} className="w-full h-96 rounded-lg border border-slate-300 dark:border-slate-700"/></div>}
+        <p className="text-xs text-slate-500 dark:text-slate-400">Local PDF preview only. Automatic extraction is not available yet. Selecting a PDF does not change published schedules.</p>
+      </div>
       <div className="flex gap-2 flex-wrap"><select aria-label="Route" className={field+' max-w-md'} value={routeId} onChange={e=>setRouteId(e.target.value)}><option value="">Select route</option>{snapshot.transport_routes.map(r=><option key={String(r.id)} value={String(r.id)}>{r.route_code} — {r.title}</option>)}</select><button className={button} onClick={addRoute}>+ Route</button></div>
       {route&&<>
       <div className="grid grid-cols-2 md:grid-cols-3 gap-2">{['route_code','title','schedule_type','capacity','center_eta_name'].map(k=>edit('transport_routes',snapshot.transport_routes.indexOf(route),route,k,k==='capacity'))}<button className={button+' text-red-600'} onClick={()=>{if(window.confirm('Remove this route and all its stops and trips?')){remove('transport_routes',route);setRouteId('');}}}>Remove route</button></div>
