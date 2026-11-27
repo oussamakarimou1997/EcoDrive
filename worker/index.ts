@@ -7,7 +7,6 @@ import {
   NotFoundError,
   UnauthorizedError,
   ValidationError,
-  changeAdminAccessCode,
   checkVerifyRateLimit,
   clearVerifyRateLimit,
   createBranchInfoInDb,
@@ -26,7 +25,6 @@ import {
   replacePricesDatasetInDb,
   revokeAdminSessionToken,
   rollbackPricesDatasetInDb,
-  setupInitialAdminAccessCode,
   updateBranchInfoInDb,
   updateInstructorInDb,
   updatePriceRecordInDb,
@@ -746,27 +744,7 @@ async function handleApiRequest(request: Request, env: Env, url: URL): Promise<R
     }
 
     if (pathname === '/api/admin/setup' && method === 'POST') {
-      try {
-        const body = await readJsonBody<{ accessCode?: unknown }>(request);
-        const session = await setupInitialAdminAccessCode(
-          env.DB,
-          body.accessCode,
-          env.ADMIN_ACCESS_CODE
-        );
-        return jsonResponse(session, 201);
-      } catch (err) {
-        if (err instanceof BadJsonError) {
-          return jsonResponse({ error: err.message }, err.status);
-        }
-        if (err instanceof ValidationError) {
-          return jsonResponse({ error: err.message, fieldErrors: err.fieldErrors }, 400);
-        }
-        if (err instanceof ConflictError) {
-          return jsonResponse({ error: err.message }, 409);
-        }
-        console.error('Error setting up admin access code:', err);
-        return jsonResponse({ error: 'Failed to configure Admin Access Code.' }, 500);
-      }
+      return jsonResponse({ error: 'Access Code is managed by the owner only.', code: 'OWNER_MANAGED_ACCESS' }, 403);
     }
 
     if (pathname === '/api/admin/verify' && method === 'POST') {
@@ -810,36 +788,7 @@ async function handleApiRequest(request: Request, env: Env, url: URL): Promise<R
     }
 
     if (pathname === '/api/admin/change-code' && method === 'POST') {
-      const authError = await requireAdminAuth(request, env);
-      if (authError) return authError;
-
-      try {
-        const body = await readJsonBody<{ currentCode?: unknown; newCode?: unknown }>(
-          request
-        );
-        const session = await changeAdminAccessCode(
-          env.DB,
-          body.currentCode,
-          body.newCode,
-          env.ADMIN_ACCESS_CODE
-        );
-        return jsonResponse(session, 200);
-      } catch (err) {
-        if (err instanceof BadJsonError) {
-          return jsonResponse({ error: err.message }, err.status);
-        }
-        if (err instanceof UnauthorizedError) {
-          return jsonResponse(
-            { error: 'Access denied. Invalid Admin Access Code.' },
-            401
-          );
-        }
-        if (err instanceof ValidationError) {
-          return jsonResponse({ error: err.message, fieldErrors: err.fieldErrors }, 400);
-        }
-        console.error('Error changing admin access code:', err);
-        return jsonResponse({ error: 'Failed to update Admin Access Code.' }, 500);
-      }
+      return jsonResponse({ error: 'Access Code is managed by the owner only.', code: 'OWNER_MANAGED_ACCESS' }, 403);
     }
 
     if (pathname === '/api/admin/logout' && method === 'POST') {
