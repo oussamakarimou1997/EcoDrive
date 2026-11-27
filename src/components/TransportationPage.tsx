@@ -79,7 +79,7 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
           if(!match){
             if(current && /PICKUP/i.test(value) && /DEPARTURE/i.test(value)){
               const pickups=line.filter(i=>/PICKUP/i.test(i.str));
-              const eta=line.find(i=>/ESTIMATED/i.test(i.str));
+              const eta=line.find(i=>/ESTIMATED|\bETA\b|ARRIVAL/i.test(i.str));
               const departure=line.find(i=>/DEPARTURE/i.test(i.str));
               columns=pickups.length&&eta&&departure?[...pickups.map(i=>i.x).sort((a,b)=>a-b),eta.x,departure.x]:[];
               if(pickups.length && eta && previous.length){
@@ -179,7 +179,7 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
     if(!snapshot||!pdf||!pdfRoutes.length)return;
     setError('');
     try{
-      if(pdfRoutes.some(r=>!r.stops.length||!r.times.length||r.warnings.length||r.times.some(t=>t.pickup.length!==r.stops.length)))throw new Error('Incomplete or unresolved PDF rows. Correct extraction before importing.');
+      if(pdfRoutes.some(r=>!r.stops.length||!r.times.length||r.warnings.length||r.times.some(t=>t.pickup.length!==r.stops.length)))throw new Error('Incomplete or unresolved PDF rows: '+pdfRoutes.filter(r=>!r.stops.length||!r.times.length||r.warnings.length||r.times.some(t=>t.pickup.length!==r.stops.length)).map(r=>r.code).join(', ')+'. Correct extraction before importing.');
       if(!window.confirm('Replace the selected centre draft with extracted routes? Published schedules will not change until Publish.'))return;
       const draft:TransportSnapshot={transport_routes:[],transport_stops:[],transport_trips:[],transport_stop_times:[],transport_departures:[]};
       const normalize=(v:unknown)=>String(v??'').toUpperCase().replace(/[^A-Z0-9]/g,'');
