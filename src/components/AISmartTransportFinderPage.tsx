@@ -645,42 +645,44 @@ const AISmartTransportFinderContent: React.FC = () => {
         unmappedStationsCount: unmappedStations.length,
       };
 
-      fetch('/api/transport/ai-recommendations', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      })
-        .then(async (resp) => {
-          const rawText = await resp.text();
-          let data: Record<string, unknown> = {};
-          try {
-            data = rawText ? (JSON.parse(rawText) as Record<string, unknown>) : {};
-          } catch {
-            if (!resp.ok) {
-              throw new Error(`AI service returned HTTP ${resp.status}. Please try again.`);
-            }
-            throw new Error('Invalid response received from AI recommendation service.');
-          }
-          if (!resp.ok) {
-            throw new Error(
-              typeof data.error === 'string' && data.error
-                ? data.error
-                : 'Unable to generate AI recommendations.'
-            );
-          }
-          setAiData(data as unknown as AIRecommendationResponse);
-        })
-        .catch((err: unknown) => {
-          if (err instanceof DOMException && err.name === 'AbortError') return;
-          setAiData(null);
-          setAiError(
-            err instanceof Error ? err.message : 'AI recommendation service is currently unavailable.'
-          );
-        })
-        .finally(() => {
-          if (!controller.signal.aborted) setAiLoading(false);
-        });
+      // Deterministic guidance from the same branch-scoped search result as the schedule.
+      // Available immediately, even if Gemini or the network is unavailable.
+      const station = payload.nearestStation;
+      const recommendations: string[] = [];
+      const headline = !station
+        ? 'No verified pickup station matches the current filters.'
+        : payload.matchStatus === 'exact_station'
+          ? 'Selected official pickup station: ' + station.name + '.'
+          : 'No exact official station selected for this location. Optional nearby pickup: ' + station.name + '.';
+      if (station) {
+        recommendations.push('Destination: ' + branchMeta.title + '.');
+        if (station.landmarks.length) recommendations.push('Pickup landmark: ' + station.landmarks.join('; ') + '.');
+        if (station.straightLineKm !== null) recommendations.push('Straight-line distance: ' + station.straightLineKm + ' km.');
+        recommendations.push(station.walkingDistanceMeters !== null
+          ? 'Walking distance: ' + station.walkingDistanceMeters + ' m' + (station.walkingDurationMinutes !== null ? '; estimated walking time: ' + station.walkingDurationMinutes + ' min.' : '.')
+          : 'Walking route data is unavailable.');
+        if (station.nextBus) {
+          const bus = station.nextBus;
+          recommendations.push('Next pickup: ' + bus.departureTime + ' (' + bus.routeCode + ')' + (bus.isNextDay ? ' — ' + bus.nextDayLabel : '') + '.');
+        } else {
+          recommendations.push('No next pickup is available under the current filters. Check the schedule or adjust filters.');
+        }
+        if (station.departures.length) recommendations.push('Scheduled pickups: ' + station.departures.map(d => d.time).join(', ') + '.');
+      } else {
+        recommendations.push('Try adjusting the distance or time filters within the selected branch.');
+      }
+      const alternative = payload.nearbyAlternatives[0];
+      const local: AIRecommendationResponse = {
+        headline,
+        recommendations,
+        alternativeTip: alternative ? 'Optional nearby alternative: ' + alternative.name + ' (' + alternative.straightLineKm + ' km straight-line).' : 'No additional nearby alternative matches the current filters.',
+        arrivalReminder: 'Arrive 5–10 minutes before pickup. ' + (station?.hasCoordinates ? 'Use Open in Google Maps to verify the pickup point.' : 'Verify the pickup location before travelling.'),
+      };
+      if (!controller.signal.aborted) {
+        setAiData(local);
+        setAiError(null);
+        setAiLoading(false);
+      }
     }, 250);
 
     return () => {
@@ -1471,10 +1473,10 @@ const AISmartTransportFinderContent: React.FC = () => {
                 </div>
                 <div>
                   <h3 className="text-sm sm:text-base font-extrabold text-[#064E3B] dark:text-emerald-200">
-                    AI Transportation Assistant ({selectedBranchMeta.shortName})
+                    Local Smart Assistant ({selectedBranchMeta.shortName})
                   </h3>
                   <p className="text-[11px] text-[#006B45] dark:text-emerald-400">
-                    Verified guidance strictly for {selectedBranchMeta.title} stations and schedules
+                    Schedule-based guidance for {selectedBranchMeta.title} · No external AI required
                   </p>
                 </div>
               </div>
@@ -1493,7 +1495,7 @@ const AISmartTransportFinderContent: React.FC = () => {
                   ) : (
                     <RotateCcw className="w-3.5 h-3.5" />
                   )}
-                  <span>{aiLoading ? 'Analyzing...' : 'Refresh AI'}</span>
+                  <span>{aiLoading ? 'Analyzing...' : 'Refresh guidance'}</span>
                 </button>
               </div>
             </div>
@@ -1556,7 +1558,7 @@ const AISmartTransportFinderContent: React.FC = () => {
               </div>
             ) : (
               <div className="bg-white/80 dark:bg-slate-900/70 border border-[#D1FAE5] dark:border-emerald-800/50 rounded-xl p-3.5 text-xs text-[#475569] dark:text-slate-300 flex items-center justify-between gap-3">
-                <span>Click &ldquo;Refresh AI&rdquo; to generate personalized transportation guidance for your selected stop.</span>
+                <span>Click Refresh guidance to update transportation guidance for your selected stop.</span>
               </div>
             )}
           </section>
