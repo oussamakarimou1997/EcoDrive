@@ -432,16 +432,19 @@ STRICT ACCURACY & GROUNDING RULES:
 7. Remind the student to arrive 5–10 minutes early at the pickup point and use the "Open in Google Maps" button when station coordinates are available.
 8. If studentRequirements is present in the JSON context, directly address those student requirements using ONLY the verified data provided.`;
 
-    let response: Awaited<ReturnType<typeof ai.models.generateContent>> | null = null;
-    let lastErr: unknown = null;
-
-    for (let attempt = 0; attempt < 3; attempt++) {
+    const models = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
+    let lastErr: unknown;
+    for (const model of models) {
+      if (request.signal.aborted) break;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 3200);
       try {
-        response = await ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
+        const response = await ai.models.generateContent({
+          model,
           contents: `Analyze this verified Eco Drive bus search result and generate concise, accurate recommendations for the student:\n${JSON.stringify(modelPayload)}`,
           config: {
             systemInstruction,
+            abortSignal: controller.signal,
             responseMimeType: 'application/json',
             responseSchema: {
               type: Type.OBJECT,
@@ -472,47 +475,23 @@ STRICT ACCURACY & GROUNDING RULES:
             },
           },
         });
-        break;
-      } catch (attemptErr: unknown) {
-        lastErr = attemptErr;
-        const msg =
-          attemptErr instanceof Error ? attemptErr.message : String(attemptErr || '');
-        if (attempt < 2 && isTransientGeminiError(msg)) {
-          const delayMs = 300 * Math.pow(3, attempt);
-          await new Promise((resolve) => setTimeout(resolve, delayMs));
-          continue;
-        }
-        throw attemptErr;
+
+        const rawText = response.text?.trim();
+        if (!rawText) throw new Error('Invalid AI response: empty');
+        const parsed: unknown = JSON.parse(stripJsonCodeFences(rawText));
+        if (!isValidAiRecommendationPayload(parsed)) throw new Error('Invalid AI response: schema');
+        return jsonResponse({ ...parsed as Record<string, unknown>, model }, 200);
+      } catch (error) {
+        lastErr = error;
+        const message = error instanceof Error ? error.message : String(error);
+        if (!controller.signal.aborted && !isTransientGeminiError(message) &&
+            !/404|NOT_FOUND|INVALID AI RESPONSE/i.test(message) && !(error instanceof SyntaxError)) throw error;
+        console.warn('AI model unavailable:', model);
+      } finally {
+        clearTimeout(timer);
       }
     }
-
-    if (!response) {
-      throw lastErr || new Error('AI request failed after retries.');
-    }
-
-    const rawText = response.text?.trim();
-    if (!rawText) {
-      return jsonResponse({ error: 'AI returned an empty recommendation response.' }, 502);
-    }
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(stripJsonCodeFences(rawText));
-    } catch {
-      return jsonResponse(
-        { error: 'AI returned a malformed response format. Please click Retry AI.' },
-        502
-      );
-    }
-
-    if (!isValidAiRecommendationPayload(parsed)) {
-      return jsonResponse(
-        { error: 'AI response was missing required guidance fields. Please click Retry AI.' },
-        502
-      );
-    }
-
-    return jsonResponse(parsed, 200);
+    throw lastErr || new Error('AI request unavailable');
   } catch (err: unknown) {
     console.error('Gemini AI recommendations error:', err);
     const message =
