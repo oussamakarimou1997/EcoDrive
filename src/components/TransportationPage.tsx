@@ -187,27 +187,39 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
         const old=snapshot.transport_routes.find(x=>normalize(x.route_code)===normalize(r.code));
         if(!old)throw new Error('New route '+r.code+' requires capacity and schedule type verification. Import blocked.');
         const id=String(old.id);
-        draft.transport_routes.push({...old,title:r.title,active:1});
+        draft.transport_routes.push({...old,title:normalize(old.title)===normalize(r.title)?old.title:r.title,active:1});
         const stops=r.stops.map((name,position)=>{
           const matches=snapshot.transport_stops.filter(x=>x.route_id===id&&normalize(x.name)===normalize(name));
           const prior=matches.length===1?matches[0]:null;
-          return {id:prior?.id??uid(),route_id:id,name,landmark:prior?.landmark??'',pin_url:prior?.pin_url&&r.pins.includes(String(prior.pin_url))?prior.pin_url:null,latitude:prior?.pin_url&&r.pins.includes(String(prior.pin_url))?prior.latitude:null,longitude:prior?.pin_url&&r.pins.includes(String(prior.pin_url))?prior.longitude:null,position,active:1};
+          return {id:prior?.id??uid(),route_id:id,name:prior?.name??name,landmark:prior?.landmark??'',pin_url:prior?.pin_url&&r.pins.includes(String(prior.pin_url))?prior.pin_url:null,latitude:prior?.pin_url&&r.pins.includes(String(prior.pin_url))?prior.latitude:null,longitude:prior?.pin_url&&r.pins.includes(String(prior.pin_url))?prior.longitude:null,position,active:1};
         });
         draft.transport_stops.push(...stops);
         let departurePosition=0;
+        const usedTrips=new Set<unknown>(),usedDepartures=new Set<unknown>();
+        const timeKey=(v:unknown)=>String(v??'').replace(/\s/g,'').toUpperCase().replace(/^0(?=\d:)/,'');
+        const addDeparture=(time:string,notes:string|null)=>{
+          const candidates=snapshot.transport_departures.filter(x=>x.route_id===id&&!usedDepartures.has(x.id)&&timeKey(x.departure_time)===timeKey(time)&&normalize(x.notes)===normalize(notes));
+          const prior=candidates.length===1?candidates[0]:undefined;
+          if(prior)usedDepartures.add(prior.id);
+          draft.transport_departures.push({id:prior?.id??uid(),route_id:id,departure_time:prior?.departure_time??time,destination:prior?.destination??null,notes:prior?.notes??notes,position:departurePosition++,active:1});
+        };
         for(const [position,t] of r.times.entries()){
-          const tripId=uid();
-          draft.transport_trips.push({id:tripId,route_id:id,position,eta:t.eta,departure:t.departure,notes:t.notes||null,active:1});
-          stops.forEach((stop,i)=>draft.transport_stop_times.push({route_id:id,trip_id:tripId,stop_id:stop.id,pickup_time:t.pickup[i]}));
-          draft.transport_departures.push({id:uid(),route_id:id,departure_time:t.departure,destination:null,notes:t.notes||null,position:departurePosition++,active:1});
+          const candidates=snapshot.transport_trips.filter(x=>x.route_id===id&&!usedTrips.has(x.id)&&timeKey(x.eta)===timeKey(t.eta)&&timeKey(x.departure)===timeKey(t.departure)&&normalize(x.notes)===normalize(t.notes)&&stops.every((stop,i)=>snapshot.transport_stop_times.some(v=>v.trip_id===x.id&&v.stop_id===stop.id&&timeKey(v.pickup_time)===timeKey(t.pickup[i]))));
+          const prior=candidates.length===1?candidates[0]:undefined;
+          if(prior)usedTrips.add(prior.id);
+          const tripId=prior?.id??uid();
+          draft.transport_trips.push({id:tripId,route_id:id,position,eta:prior?.eta??t.eta,departure:prior?.departure??t.departure,notes:prior?.notes??(t.notes||null),active:1});
+          stops.forEach((stop,i)=>draft.transport_stop_times.push({route_id:id,trip_id:tripId,stop_id:stop.id,pickup_time:snapshot.transport_stop_times.find(v=>v.trip_id===tripId&&v.stop_id===stop.id)?.pickup_time??t.pickup[i]}));
+          addDeparture(t.departure,t.notes||null);
         }
         for(const extra of r.extraDepartures){
           const m=extra.match(/^\s*((?:0?[1-9]|1[0-2]):[0-5]\d\s*[AP]M)\s*(.*)$/i);
           if(!m)throw new Error('Unresolved additional departure in '+r.code);
-          draft.transport_departures.push({id:uid(),route_id:id,departure_time:m[1].replace(/\s/g,'').toUpperCase(),destination:null,notes:m[2]||null,position:departurePosition++,active:1});
+          addDeparture(m[1].replace(/\s/g,'').toUpperCase(),m[2]||null);
         }
       }
-      setSnapshot(draft);setRouteId(String(draft.transport_routes[0].id));setDirty(true);setReview(false);setSourceFilename(pdf.name);
+      const same=original&&Object.keys(draft).every(k=>draft[k].length===original[k].length&&draft[k].every(row=>original[k].some(old=>Object.keys({...old,...row}).every(f=>old[f]===row[f]))));
+      setSnapshot(draft);setRouteId(String(draft.transport_routes[0].id));setDirty(!same);setReview(true);setSourceFilename(pdf.name);
     }catch(e){setError(e instanceof Error?e.message:String(e));}
   }
   const route=snapshot?.transport_routes.find(r=>r.id===routeId);
@@ -244,9 +256,9 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
       </>}
       <div className="flex gap-2"><button className={primary} disabled={!dirty} onClick={()=>setReview(true)}>Review changes</button></div>
       {review&&<div className="border rounded-xl p-3 space-y-3">
-        <h3 className="font-bold">Review before publish</h3>
+        <h3 className="font-bold">Review before publish</h3>{!dirty&&<p role="status" className="text-emerald-600 font-semibold">No changes detected. Published schedule is already up to date.</p>}
         {sourceFilename&&<p className="text-xs">Imported from {sourceFilename}</p>}
-        <p className="text-xs text-amber-600">Check all changes against the official PDF. Newly generated trip IDs appear as removed and added rows.</p>
+        <p className="text-xs text-amber-600">Check all changes against the official PDF. Unmatched trips appear as removed and added rows; unchanged trips retain their IDs.</p>
         {Object.keys(snapshot).map(k=>{
           const before=original?.[k]||[],after=snapshot[k];
           const key=(r:TransportRow)=>k==='transport_stop_times'?String(r.trip_id)+'|'+String(r.stop_id):String(r.id);
@@ -262,7 +274,7 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
           </details>;
         })}
         {snapshot.transport_stops.some(r=>!r.pin_url)&&<p className="text-xs text-amber-600">Some stops have no GPS link. Verify or correct them before publishing.</p>}
-        <div className="flex flex-wrap gap-2"><button className={button} onClick={()=>setReview(false)}>Back to editing</button><button className={button} onClick={()=>{if(original&&window.confirm('Discard all draft changes?')){setSnapshot(structuredClone(original));setRouteId(String(original.transport_routes[0]?.id??''));setDirty(false);setReview(false);setSourceFilename(null);}}}>Discard draft</button><button className={primary} onClick={()=>{if(window.confirm('Publish the reviewed schedule for '+(center==='dic'?'DIC':'Al Quoz')+'? Confirm that all changes and GPS links have been checked.'))publish();}}>Confirm & Publish</button></div>
+        <div className="flex flex-wrap gap-2"><button className={button} onClick={()=>setReview(false)}>Back to editing</button><button className={button} onClick={()=>{if(original&&window.confirm('Discard all draft changes?')){setSnapshot(structuredClone(original));setRouteId(String(original.transport_routes[0]?.id??''));setDirty(false);setReview(false);setSourceFilename(null);}}}>Discard draft</button><button className={primary} disabled={!dirty} onClick={()=>{if(window.confirm('Publish the reviewed schedule for '+(center==='dic'?'DIC':'Al Quoz')+'? Confirm that all changes and GPS links have been checked.'))publish();}}>Confirm & Publish</button></div>
       </div>}
       <h3 className="font-bold">Backups</h3>{backups.length===0&&<p className="text-xs">No backups yet.</p>}{backups.map(b=><div key={b.id} className="flex justify-between items-center gap-2 text-xs"><span>{b.created_at} {b.source_filename||''}</span><button className={button} onClick={()=>{if(window.confirm('Restore this backup? Current published data will be backed up; unsaved edits will be discarded.'))publish(b.id);}}>Restore</button></div>)}
     </fieldset>}
