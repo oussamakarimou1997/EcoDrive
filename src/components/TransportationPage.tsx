@@ -36,7 +36,7 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
   const [routeId,setRouteId]=useState('');
   const [review,setReview]=useState(false);
   const [pdf,setPdf]=useState<{name:string;url:string}|null>(null);
-  const [pdfRoutes,setPdfRoutes]=useState<{code:string;title:string;stops:string[];pins:string[]}[]>([]);
+  const [pdfRoutes,setPdfRoutes]=useState<{code:string;title:string;stops:string[];pins:string[];times:{pickup:string[];eta:string;departure:string;notes:string}[];extraDepartures:string[];warnings:string[]}[]>([]);
   useEffect(()=>{setPdfRoutes([]);},[pdf]);
   async function extractRoutes(){
     if(!pdf)return;
@@ -48,7 +48,7 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
       const lib=await import(/* @vite-ignore */ url);
       lib.GlobalWorkerOptions.workerSrc='https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.mjs';
       doc=await lib.getDocument({data:await (await fetch(pdf.url)).arrayBuffer(),isEvalSupported:false}).promise;
-      const found=new Map<string,{code:string;title:string;stops:string[];pins:string[]}>();
+      const found=new Map<string,{code:string;title:string;stops:string[];pins:string[];times:{pickup:string[];eta:string;departure:string;notes:string}[];extraDepartures:string[];warnings:string[]}>();
       for(let n=1;n<=doc.numPages;n++){
         const page=await doc.getPage(n);
         const content=await page.getTextContent();
@@ -59,8 +59,9 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
           const line=lines.get(y)||[];
           line.push({x:item.transform[4],str:item.str});lines.set(y,line);
         }
-        let current:{code:string;title:string;stops:string[];pins:string[]}|undefined;
+        let current:{code:string;title:string;stops:string[];pins:string[];times:{pickup:string[];eta:string;departure:string;notes:string}[];extraDepartures:string[];warnings:string[]}|undefined;
         let previous:{x:number;str:string}[]=[];
+        let columns:number[]=[];
         for(const [,line] of [...lines.entries()].sort((a,b)=>b[0]-a[0])){
           const value=line.sort((a,b)=>a.x-b.x).map(i=>i.str).join(' ').replace(/\s+/g,' ').trim();
           if(current && /PIN LOCATION/i.test(value)){
@@ -74,6 +75,8 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
             if(current && /PICKUP/i.test(value) && /DEPARTURE/i.test(value)){
               const pickups=line.filter(i=>/PICKUP/i.test(i.str));
               const eta=line.find(i=>/ESTIMATED/i.test(i.str));
+              const departure=line.find(i=>/DEPARTURE/i.test(i.str));
+              columns=pickups.length&&eta&&departure?[...pickups.map(i=>i.x).sort((a,b)=>a-b),eta.x,departure.x]:[];
               if(pickups.length && eta && previous.length){
                 const centers=pickups.map(i=>i.x).sort((a,b)=>a-b);
                 const groups=centers.map(()=>[] as string[]);
@@ -87,11 +90,24 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
                 if(names.every(Boolean)&&names.length===pickups.length)current.stops=names;
               }
             }
+            else if(current && columns.length){
+              const matches=[...value.matchAll(/\b(?:0?[1-9]|1[0-2]):[0-5]\d\s*[AP]M\b/gi)];
+              const times=matches.map(m=>m[0].replace(/\s/g,'').toUpperCase());
+              if(times.length===columns.length){
+                current.times.push({pickup:times.slice(0,-2),eta:times[times.length-2],departure:times[times.length-1],notes:value.slice((matches[matches.length-1].index??0)+matches[matches.length-1][0].length).trim()});
+              }else if(times.length===1 && line.every(i=>i.x>(columns[columns.length-2]+columns[columns.length-1])/2)){
+                current.extraDepartures.push(value);
+              }else if(times.length){
+                current.warnings.push('Unresolved schedule row: '+value);
+              }else if(/FULL WEEK SCHEDULE|CAPACITY|PIN LOCATION|LANDMARK/i.test(value)){
+                columns=[];
+              }
+            }
             previous=line;continue;
           }
           const code='ROUTE '+Number(match[1]),title=match[2].trim();
           if(found.has(code)&&found.get(code)?.title!==title)throw new Error('Conflicting headings for '+code);
-          current={code,title,stops:found.get(code)?.stops||[],pins:found.get(code)?.pins||[]};found.set(code,current);previous=line;
+          current={code,title,stops:found.get(code)?.stops||[],pins:found.get(code)?.pins||[],times:found.get(code)?.times||[],extraDepartures:found.get(code)?.extraDepartures||[],warnings:found.get(code)?.warnings||[]};found.set(code,current);columns=[];previous=line;
         }
       }
       if(!found.size)throw new Error('No route headings found. Select a text-based schedule PDF.');
@@ -167,9 +183,9 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
           <input type="file" accept=".pdf,application/pdf" className="sr-only" onChange={e=>{void selectPdf(e.target.files?.[0]);e.target.value='';}}/>
         </label>
         {pdf&&<div className="space-y-2"><div className="flex flex-wrap items-center justify-between gap-2 text-xs"><span>{pdf.name}</span><div className="flex gap-2"><a href={pdf.url} target="_blank" rel="noopener noreferrer" className={button}>Open PDF</a><button className={button} onClick={()=>setPdf(null)}>Remove PDF</button></div></div><iframe title="Schedule PDF preview" src={pdf.url} className="w-full h-96 rounded-lg border border-slate-300 dark:border-slate-700"/></div>}
-        {pdf&&<button className={primary} onClick={()=>void extractRoutes()}>Extract Routes, Stops & GPS</button>}
-        {pdfRoutes.length>0&&<div className="space-y-2"><h4 className="font-bold text-sm">{pdfRoutes.length} routes found</h4>{pdfRoutes.map(r=><div key={r.code} className="text-xs border-b border-slate-200 dark:border-slate-800 py-2"><strong>{r.code}</strong> — {r.title}<div className="mt-2 pl-3 space-y-1">{r.stops.length?r.stops.map((name,i)=><p key={i}>{i+1}. {name}</p>):<p className="text-amber-600">Pickup columns could not be read — check PDF manually.</p>}</div><div className="mt-2 space-y-1"><strong>GPS links ({r.pins.length})</strong>{r.pins.map((pin,i)=><p key={i}><a className="text-emerald-600 underline break-all" href={pin} target="_blank" rel="noopener noreferrer">{i+1}. {pin}</a></p>)}<p className="text-amber-600">Verify each link against its stop in the PDF before assigning it. {r.pins.length!==r.stops.length?"Link and stop counts differ.":""}</p></div></div>)}</div>}
-        <p className="text-xs text-slate-500 dark:text-slate-400">Route, pickup stop and GPS link extraction preview only. Verify the centre and route headings against the PDF. No schedule changes are saved.</p>
+        {pdf&&<button className={primary} onClick={()=>void extractRoutes()}>Extract Schedule</button>}
+        {pdfRoutes.length>0&&<div className="space-y-2"><h4 className="font-bold text-sm">{pdfRoutes.length} routes found</h4>{pdfRoutes.map(r=><div key={r.code} className="text-xs border-b border-slate-200 dark:border-slate-800 py-2"><strong>{r.code}</strong> — {r.title}<div className="mt-2 pl-3 space-y-1">{r.stops.length?r.stops.map((name,i)=><p key={i}>{i+1}. {name}</p>):<p className="text-amber-600">Pickup columns could not be read — check PDF manually.</p>}</div><div className="mt-2 space-y-1"><strong>GPS links ({r.pins.length})</strong>{r.pins.map((pin,i)=><p key={i}><a className="text-emerald-600 underline break-all" href={pin} target="_blank" rel="noopener noreferrer">{i+1}. {pin}</a></p>)}<p className="text-amber-600">Verify each link against its stop in the PDF before assigning it. {r.pins.length!==r.stops.length?"Link and stop counts differ.":""}</p></div><div className="mt-3 overflow-x-auto"><strong>Schedule ({r.times.length} trips)</strong>{r.times.length>0&&<table className="w-full text-xs text-left"><thead><tr>{r.times[0].pickup.map((_,i)=><th key={i} className="p-1">{r.stops[i]||'Pickup '+(i+1)}</th>)}<th>ETA</th><th>Departure</th><th>Notes</th></tr></thead><tbody>{r.times.map((t,i)=><tr key={i} className="border-t">{t.pickup.map((v,j)=><td key={j} className="p-1">{v}</td>)}<td>{t.eta}</td><td>{t.departure}</td><td>{t.notes}</td></tr>)}</tbody></table>}{r.extraDepartures.map((v,i)=><p key={i}>Additional departure: {v}</p>)}{!r.times.length&&<p className="text-amber-600">No complete schedule rows extracted.</p>}{r.warnings.map((v,i)=><p key={i} className="text-amber-600">{v}</p>)}</div></div>)}</div>}
+        <p className="text-xs text-slate-500 dark:text-slate-400">Schedule extraction preview only. Verify the centre and route headings against the PDF. No schedule changes are saved.</p>
       </div>
       <div className="flex gap-2 flex-wrap"><select aria-label="Route" className={field+' max-w-md'} value={routeId} onChange={e=>setRouteId(e.target.value)}><option value="">Select route</option>{snapshot.transport_routes.map(r=><option key={String(r.id)} value={String(r.id)}>{r.route_code} — {r.title}</option>)}</select><button className={button} onClick={addRoute}>+ Route</button></div>
       {route&&<>
