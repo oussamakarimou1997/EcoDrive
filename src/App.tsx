@@ -12,7 +12,37 @@ import { AlertCircle, CheckCircle2, Info } from 'lucide-react';
 import { ThemeProvider } from './context/ThemeContext';
 import { AdminAuthProvider, ToastVariant } from './context/AdminAuthContext';
 
+import { TRANSPORT_CENTERS, TRANSPORT_ROUTES } from './data/transportationData';
+import type { TransportRoute } from './types/transportation';
+
 export default function App() {
+  const [transportStatus, setTransportStatus] = useState<'loading'|'live'|'fallback'>('loading');
+  useEffect(() => {
+    let active = true;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 5000);
+    fetch('/api/transport/catalog', {signal:controller.signal, cache:'no-store'})
+      .then(async res => {
+        if (!res.ok) throw new Error('Catalog unavailable');
+        const data = await res.json() as {routes:TransportRoute[]};
+        if (!Array.isArray(data.routes) || !['dic','al_quoz'].every(c=>data.routes.some(r=>r.centerId===c)) ||
+            !data.routes.every(r=>typeof r.id==='string' && Array.isArray(r.stops) && r.stops.length && Array.isArray(r.trips) && r.trips.length)) throw new Error('Invalid catalog');
+        if (!active) return;
+        TRANSPORT_ROUTES.splice(0,TRANSPORT_ROUTES.length,...data.routes);
+        for (const center of TRANSPORT_CENTERS) {
+          const routes = data.routes.filter(r=>r.centerId===center.id);
+          const names = [...new Set(routes.flatMap(r=>r.stops.map(s=>s.name)))];
+          center.routesCount=routes.length;
+          center.badge=routes.length+' Routes • '+names.length+' Key Stops';
+          center.description='Serving '+names.join(', ')+'.';
+        }
+        setTransportStatus('live');
+      })
+      .catch(()=>{if(active) setTransportStatus('fallback');})
+      .finally(()=>window.clearTimeout(timer));
+    return ()=>{active=false;controller.abort();window.clearTimeout(timer);};
+  }, []);
+
   // Navigation tab state (prices | transport | ai-transport-finder | branches | branch-info | instructors)
   const [activeTab, setActiveTab] = useState<ActiveTab>('prices');
 
@@ -220,9 +250,14 @@ export default function App() {
                 />
               )}
 
-              {activeTab === 'transport' && <TransportationPage />}
+              {(activeTab === 'transport' || activeTab === 'ai-transport-finder') && transportStatus !== 'live' && (
+                <div role="status" className="mb-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+                  {transportStatus === 'loading' ? 'Loading transportation schedules…' : 'Live schedules unavailable. Showing saved schedules; confirm times before travel.'}
+                </div>
+              )}
+              {activeTab === 'transport' && transportStatus !== 'loading' && <TransportationPage />}
 
-              {activeTab === 'ai-transport-finder' && <AISmartTransportFinderPage />}
+              {activeTab === 'ai-transport-finder' && transportStatus !== 'loading' && <AISmartTransportFinderPage />}
 
               {activeTab === 'branches' && <BranchLocationPage />}
 
