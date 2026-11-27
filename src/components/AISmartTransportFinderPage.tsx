@@ -24,6 +24,7 @@ import {
   Lock,
   GitBranch,
 } from 'lucide-react';
+import { getTripReturnDepartures, formatReturnDeparture } from '../types/transportation';
 import { TRANSPORT_ROUTES } from '../data/transportationData';
 import {
   AIRecommendationResponse,
@@ -280,6 +281,12 @@ const AISmartTransportFinderContent: React.FC = () => {
     if (!primaryResult || !selectedBranch) return [];
     return getSameRouteStations(primaryResult.station, selectedBranch, allStations);
   }, [primaryResult, selectedBranch, allStations]);
+
+  const additionalReturnDepartures = TRANSPORT_ROUTES
+    .filter(route => route.centerId === selectedBranch && sameRouteLines.some(line => line.routeId === route.id))
+    .flatMap(route => (route.departures || [])
+      .filter(departure => !route.trips.some(trip => getTripReturnDepartures(route, trip).some(match => match.id === departure.id)))
+      .map(departure => ({ key: route.id + ':' + departure.id, routeCode: route.routeCode, label: formatReturnDeparture(departure) })));
 
   // Next 3 closest optional nearby alternative stops belonging ONLY to selectedBranch
   const otherNearbyResults = useMemo(() => {
@@ -1810,6 +1817,19 @@ const AISmartTransportFinderContent: React.FC = () => {
                   })}
                 </tbody>
               </table>
+            </div>
+          )}
+          {additionalReturnDepartures.length > 0 && (
+            <div className="p-4 sm:p-5 border-t border-[#E2E8F0] dark:border-slate-800 space-y-2">
+              <h4 className="text-sm font-bold text-[#0F172A] dark:text-slate-100">Additional Return Departures from Eco Drive</h4>
+              <p className="text-xs text-[#64748B] dark:text-slate-400">Return buses leaving the selected training centre, not pickup times.</p>
+              <div className="flex flex-wrap gap-2">
+                {additionalReturnDepartures.map(departure => (
+                  <span key={departure.key} className="rounded-lg px-3 py-1.5 text-xs font-bold bg-[#F0FDF4] dark:bg-emerald-950/60 text-[#006B45] dark:text-emerald-300">
+                    {departure.routeCode} · {departure.label}
+                  </span>
+                ))}
+              </div>
             </div>
           )}
         </section>
