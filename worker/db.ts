@@ -38,9 +38,6 @@ import {
 } from '../src/types/prices';
 import {
   generateRandomHexToken,
-  hashAccessCodePbkdf2,
-  sha256Hex,
-  verifyAccessCodeHash,
   verifyEnvAccessCodeConstantTime,
 } from './crypto';
 
@@ -936,12 +933,20 @@ async function pruneExpiredSessions(db: D1Database): Promise<void> {
   await db.prepare('DELETE FROM admin_sessions WHERE expires_at <= ?').bind(nowIso).run();
 }
 
+// Bind the stored digest to the current secret without storing a code fingerprint.
+async function adminSessionDigest(token: string, envCode: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', encoder.encode(envCode), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const signature = await crypto.subtle.sign('HMAC', key, encoder.encode('ecodrive-admin-session-v2:' + token));
+  return Array.from(new Uint8Array(signature), b => b.toString(16).padStart(2, '0')).join('');
+}
+
 async function createAdminSession(
-  db: D1Database
+  db: D1Database, envCode: string
 ): Promise<{ token: string; expiresAt: string }> {
   await pruneExpiredSessions(db);
   const token = generateRandomHexToken(32);
-  const tokenHash = await sha256Hex(token);
+  const tokenHash = await adminSessionDigest(token, envCode);
   const now = new Date();
   const expiresAt = new Date(now.getTime() + ADMIN_SESSION_TTL_MS).toISOString();
 
@@ -957,53 +962,10 @@ async function createAdminSession(
 }
 
 export async function getAdminAuthStatus(
-  db: D1Database,
+  _db: D1Database,
   envAdminCode?: string
 ): Promise<{ configured: boolean; managedByEnv: boolean }> {
-  const envCode = normalizeEnvAdminAccessCode(envAdminCode);
-  if (envCode) {
-    return { configured: true, managedByEnv: true };
-  }
-  const row = await db
-    .prepare('SELECT id FROM admin_auth WHERE id = ?')
-    .bind('primary')
-    .first<{ id: string }>();
-  return { configured: Boolean(row), managedByEnv: false };
-}
-
-export async function setupInitialAdminAccessCode(
-  db: D1Database,
-  rawCode: unknown,
-  envAdminCode?: string
-): Promise<{ token: string; expiresAt: string }> {
-  if (normalizeEnvAdminAccessCode(envAdminCode)) {
-    throw new ConflictError('Admin Access Code is already configured via environment secret.');
-  }
-
-  const code = typeof rawCode === 'string' ? rawCode.trim() : '';
-  if (code.length < 4 || code.length > 64) {
-    throw new ValidationError('Admin Access Code must be between 4 and 64 characters.', {
-      accessCode: 'Admin Access Code must be between 4 and 64 characters.',
-    });
-  }
-
-  const hash = await hashAccessCodePbkdf2(code);
-  const now = new Date().toISOString();
-
-  // Atomic one-time insert via INSERT OR IGNORE
-  const insertResult = await db
-    .prepare(
-      `INSERT OR IGNORE INTO admin_auth (id, password_hash, updated_at)
-       VALUES (?, ?, ?)`
-    )
-    .bind('primary', hash, now)
-    .run();
-
-  if (!insertResult.meta || insertResult.meta.changes === 0) {
-    throw new ConflictError('Admin Access Code has already been configured.');
-  }
-
-  return createAdminSession(db);
+  return { configured: Boolean(normalizeEnvAdminAccessCode(envAdminCode)), managedByEnv: true };
 }
 
 export async function checkVerifyRateLimit(
@@ -1065,29 +1027,10 @@ export async function verifyAdminAccessCodeAndCreateSession(
   }
 
   const envCode = normalizeEnvAdminAccessCode(envAdminCode);
-  if (envCode) {
-    const valid = await verifyEnvAccessCodeConstantTime(code, envCode);
-    if (!valid) {
-      throw new UnauthorizedError('Access denied. Invalid Admin Access Code.');
-    }
-    return createAdminSession(db);
-  }
-
-  const row = await db
-    .prepare('SELECT password_hash FROM admin_auth WHERE id = ?')
-    .bind('primary')
-    .first<{ password_hash: string }>();
-
-  if (!row) {
-    throw new ValidationError('Admin Access Code is not set up yet. Please configure one first.');
-  }
-
-  const valid = await verifyAccessCodeHash(code, row.password_hash);
-  if (!valid) {
+  if (!envCode || !(await verifyEnvAccessCodeConstantTime(code, envCode))) {
     throw new UnauthorizedError('Access denied. Invalid Admin Access Code.');
   }
-
-  return createAdminSession(db);
+  return createAdminSession(db, envCode);
 }
 
 export async function validateAdminSessionToken(
@@ -1099,10 +1042,10 @@ export async function validateAdminSessionToken(
   const trimmed = token.trim();
   if (!trimmed) return false;
 
-  const { configured } = await getAdminAuthStatus(db, envAdminCode);
-  if (!configured) return false;
+  const envCode = normalizeEnvAdminAccessCode(envAdminCode);
+  if (!envCode) return false;
 
-  const tokenHash = await sha256Hex(trimmed);
+  const tokenHash = await adminSessionDigest(trimmed, envCode);
   const nowIso = new Date().toISOString();
   const row = await db
     .prepare('SELECT token_hash FROM admin_sessions WHERE token_hash = ? AND expires_at > ?')
@@ -1114,72 +1057,16 @@ export async function validateAdminSessionToken(
 
 export async function revokeAdminSessionToken(
   db: D1Database,
-  token: string | null | undefined
+  token: string | null | undefined,
+  envAdminCode?: string
 ): Promise<void> {
-  if (!token || typeof token !== 'string') return;
-  const tokenHash = await sha256Hex(token.trim());
+  const envCode = normalizeEnvAdminAccessCode(envAdminCode);
+  if (!token || typeof token !== 'string' || !envCode) return;
+  const tokenHash = await adminSessionDigest(token.trim(), envCode);
   await db
     .prepare('DELETE FROM admin_sessions WHERE token_hash = ?')
     .bind(tokenHash)
     .run();
-}
-
-export async function changeAdminAccessCode(
-  db: D1Database,
-  rawCurrentCode: unknown,
-  rawNewCode: unknown,
-  envAdminCode?: string
-): Promise<{ token: string; expiresAt: string }> {
-  if (normalizeEnvAdminAccessCode(envAdminCode)) {
-    throw new ValidationError(
-      'Admin Access Code is managed by the server ADMIN_ACCESS_CODE environment secret.'
-    );
-  }
-
-  const currentCode = typeof rawCurrentCode === 'string' ? rawCurrentCode.trim() : '';
-  const newCode = typeof rawNewCode === 'string' ? rawNewCode.trim() : '';
-
-  if (!currentCode) {
-    throw new ValidationError('Current Admin Access Code is required.', {
-      currentCode: 'Current Admin Access Code is required.',
-    });
-  }
-  if (newCode.length < 4 || newCode.length > 64) {
-    throw new ValidationError('New Admin Access Code must be between 4 and 64 characters.', {
-      newCode: 'New Admin Access Code must be between 4 and 64 characters.',
-    });
-  }
-  if (currentCode === newCode) {
-    throw new ValidationError('New Admin Access Code must be different from the current code.', {
-      newCode: 'New Admin Access Code must be different from the current code.',
-    });
-  }
-
-  const row = await db
-    .prepare('SELECT password_hash FROM admin_auth WHERE id = ?')
-    .bind('primary')
-    .first<{ password_hash: string }>();
-
-  if (!row) {
-    throw new ValidationError('Admin Access Code has not been configured yet.');
-  }
-
-  const valid = await verifyAccessCodeHash(currentCode, row.password_hash);
-  if (!valid) {
-    throw new UnauthorizedError('Access denied. Invalid Admin Access Code.');
-  }
-
-  const nextHash = await hashAccessCodePbkdf2(newCode);
-  const now = new Date().toISOString();
-
-  await db.batch([
-    db
-      .prepare('UPDATE admin_auth SET password_hash = ?, updated_at = ? WHERE id = ?')
-      .bind(nextHash, now, 'primary'),
-    db.prepare('DELETE FROM admin_sessions'),
-  ]);
-
-  return createAdminSession(db);
 }
 
 // ---------------------------------------------------------------------------
