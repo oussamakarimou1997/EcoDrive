@@ -15,6 +15,8 @@ export interface TransportStop {
   name: string;
   landmark: string;
   pinUrl?: string;
+  latitude?: number | null;
+  longitude?: number | null;
 }
 
 export interface TransportTrip {
@@ -35,4 +37,5 @@ export interface TransportRoute {
   stops: TransportStop[];
   centerEtaName: string; // e.g. "ECO DRIVE AL QUOZ" or "ECO DRIVE - DIC"
   trips: TransportTrip[];
+  departures?: { id: string; time: string; destination?: string | null; notes?: string | null }[];
 }
