@@ -1,0 +1,61 @@
+name: Preview D1 transportation schema
+on:
+  push:
+    branches: [maplibre-migration]
+    paths:
+      - '.github/workflows/preview-d1-transport.yml'
+      - 'migrations/0003_transportation_schema.sql'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: preview-d1-transport
+  cancel-in-progress: false
+jobs:
+  migrate:
+    if: github.ref == 'refs/heads/maplibre-migration'
+    runs-on: ubuntu-latest
+    environment: preview
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply and verify preview transportation schema
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, json, urllib.request, pathlib, re
+          account = os.environ['CF_ACCOUNT']
+          token = os.environ['CF_TOKEN']
+          if not re.fullmatch(r'[a-fA-F0-9]{32}', account) or not token:
+              raise SystemExit('Missing or invalid Cloudflare configuration')
+          database = 'a7351f8e-0ece-486e-8533-c3e987b6291c'
+          base = f'https://api.cloudflare.com/client/v4/accounts/{account}/d1/database/{database}'
+          def call(url, payload=None):
+              req = urllib.request.Request(url, data=None if payload is None else json.dumps(payload).encode(), headers={'Authorization': 'Bearer '+token, 'Content-Type':'application/json'})
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  result = json.load(response)
+              if not result.get('success'):
+                  raise SystemExit('Cloudflare API operation failed')
+              return result['result']
+          meta = call(base)
+          if meta.get('name') != 'ecodrive-preview-db' or meta.get('uuid') != database:
+              raise SystemExit('Preview database identity mismatch; refusing writes')
+          sql = pathlib.Path('migrations/0003_transportation_schema.sql').read_text()
+          # This migration contains only simple statements, with no embedded semicolons.
+          sql = '\n'.join(line for line in sql.splitlines() if not line.lstrip().startswith('--'))
+          for statement in sql.split(';'):
+              if statement.strip():
+                  results = call(base+'/query', {'sql':statement.strip()})
+                  if not all(row.get('success') for row in results):
+                      raise SystemExit('Migration statement failed')
+          rows = call(base+'/query', {'sql':"SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'transport_%'"})
+          names = {r['name'] for group in rows for r in group.get('results', [])}
+          expected = {'transport_centers','transport_routes','transport_stops','transport_trips','transport_stop_times','transport_departures','transport_backups'}
+          if not expected <= names:
+              raise SystemExit('Schema verification failed')
+          print('Verified seven transportation tables in ecodrive-preview-db')
+          PY
