@@ -189,7 +189,7 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
         const old=snapshot.transport_routes.find(x=>normalize(x.route_code)===normalize(r.code));
         if(!old)throw new Error('New route '+r.code+' requires capacity and schedule type verification. Import blocked.');
         const id=String(old.id);
-        draft.transport_routes.push({...old,title:normalize(old.title)===normalize(r.title)?old.title:r.title,active:1});
+        draft.transport_routes.push({...old,title:normalize(old.title)===normalize(r.title)||(center==='dic'&&normalize(r.code)==='ROUTE10'&&normalize(old.title)==='DUBAIINDUSTRIALCITYINTERNALSHUTTLE'&&normalize(r.title)==='DUBAIINDUSTRIALCITY')?old.title:r.title,active:1});
         const stops=r.stops.map((name,position)=>{
           const matches=snapshot.transport_stops.filter(x=>x.route_id===id&&normalize(x.name)===normalize(name));
           const prior=matches.length===1?matches[0]:null;
@@ -199,26 +199,41 @@ function TransportationManager({onClose}:{onClose:()=>void}) {
         let departurePosition=0;
         const usedTrips=new Set<unknown>(),usedDepartures=new Set<unknown>();
         const timeKey=(v:unknown)=>String(v??'').replace(/\s/g,'').toUpperCase().replace(/^0(?=\d:)/,'');
+        // Compare the actual departure time and its destination, not legacy combined notes.
+        const parseDeparture=(value:unknown)=>String(value??'').split('/').map(part=>{
+          const m=part.trim().match(/^((?:0?[1-9]|1[0-2]):[0-5]\d\s*[AP]M)\s*(.*)$/i);
+          return m?{time:timeKey(m[1]),note:m[2].trim()}:null;
+        });
+        const semanticNote=(value:unknown)=>normalize(String(value??'').replace(/\b(?:0?[1-9]|1[0-2]):[0-5]\d\s*[AP]M\b/gi,''));
         const addDeparture=(time:string,notes:string|null)=>{
-          const candidates=snapshot.transport_departures.filter(x=>x.route_id===id&&!usedDepartures.has(x.id)&&timeKey(x.departure_time)===timeKey(time)&&normalize(x.notes)===normalize(notes));
+          const candidates=snapshot.transport_departures.filter(x=>x.route_id===id&&!usedDepartures.has(x.id)&&timeKey(x.departure_time)===timeKey(time));
           const prior=candidates.length===1?candidates[0]:undefined;
           if(prior)usedDepartures.add(prior.id);
-          draft.transport_departures.push({id:prior?.id??uid(),route_id:id,departure_time:prior?.departure_time??time,destination:prior?.destination??null,notes:prior?.notes??notes,position:departurePosition++,active:1});
+          const destination=/^DROP OFF TO /i.test(notes??'')?notes:null;
+          const equivalent=prior&&semanticNote(prior.destination??prior.notes)===semanticNote(notes);
+          // Legacy additional departures repeat the preceding trip's note; only the actual destination applies.
+          const legacyExtra=prior&&!notes&&!prior.destination&&/\d:\d{2}\s*[AP]M/i.test(String(prior.notes??''));
+          draft.transport_departures.push({id:prior?.id??uid(),route_id:id,departure_time:prior?.departure_time??time,destination:equivalent||legacyExtra?prior.destination:destination,notes:equivalent||legacyExtra?prior.notes:notes,position:departurePosition++,active:1});
         };
+        const extras=r.extraDepartures.map(extra=>{
+          const parts=parseDeparture(extra);
+          if(parts.length!==1||!parts[0])throw new Error('Unresolved additional departure in '+r.code);
+          return parts[0];
+        });
         for(const [position,t] of r.times.entries()){
-          const candidates=snapshot.transport_trips.filter(x=>x.route_id===id&&!usedTrips.has(x.id)&&timeKey(x.eta)===timeKey(t.eta)&&timeKey(x.departure)===timeKey(t.departure)&&normalize(x.notes)===normalize(t.notes)&&stops.every((stop,i)=>snapshot.transport_stop_times.some(v=>v.trip_id===x.id&&v.stop_id===stop.id&&timeKey(v.pickup_time)===timeKey(t.pickup[i]))));
+          const candidates=snapshot.transport_trips.filter(x=>x.route_id===id&&!usedTrips.has(x.id)&&timeKey(x.eta)===timeKey(t.eta)&&stops.every((stop,i)=>snapshot.transport_stop_times.some(v=>v.trip_id===x.id&&v.stop_id===stop.id&&timeKey(v.pickup_time)===timeKey(t.pickup[i]))));
           const prior=candidates.length===1?candidates[0]:undefined;
           if(prior)usedTrips.add(prior.id);
           const tripId=prior?.id??uid();
-          draft.transport_trips.push({id:tripId,route_id:id,position,eta:prior?.eta??t.eta,departure:prior?.departure??t.departure,notes:prior?.notes??(t.notes||null),active:1});
-          stops.forEach((stop,i)=>draft.transport_stop_times.push({route_id:id,trip_id:tripId,stop_id:stop.id,pickup_time:snapshot.transport_stop_times.find(v=>v.trip_id===tripId&&v.stop_id===stop.id)?.pickup_time??t.pickup[i]}));
+          const oldParts=parseDeparture(prior?.departure);
+          const expected=[{time:timeKey(t.departure),note:t.notes||''},...(position===r.times.length-1?extras:[])];
+          const sameDeparture=prior&&oldParts.length===expected.length&&oldParts.every((part,i)=>part&&part.time===expected[i].time&&semanticNote(part.note)===semanticNote(expected[i].note));
+          const combined=expected.map(part=>[part.time,part.note].filter(Boolean).join(' ')).join(' / ');
+          draft.transport_trips.push({id:tripId,route_id:id,position,eta:prior?.eta??t.eta,departure:sameDeparture?prior.departure:combined,notes:sameDeparture?prior.notes:(t.notes||null),active:1});
+          stops.forEach((stop,i)=>draft.transport_stop_times.push({route_id:id,trip_id:tripId,stop_id:stop.id,pickup_time:t.pickup[i]}));
           addDeparture(t.departure,t.notes||null);
         }
-        for(const extra of r.extraDepartures){
-          const m=extra.match(/^\s*((?:0?[1-9]|1[0-2]):[0-5]\d\s*[AP]M)\s*(.*)$/i);
-          if(!m)throw new Error('Unresolved additional departure in '+r.code);
-          addDeparture(m[1].replace(/\s/g,'').toUpperCase(),m[2]||null);
-        }
+        for(const extra of extras)addDeparture(extra.time,extra.note||null);
       }
       const same=original&&Object.keys(draft).every(k=>draft[k].length===original[k].length&&draft[k].every(row=>original[k].some(old=>Object.keys({...old,...row}).every(f=>old[f]===row[f]))));
       setSnapshot(draft);setRouteId(String(draft.transport_routes[0].id));setDirty(!same);setReview(true);setSourceFilename(pdf.name);
