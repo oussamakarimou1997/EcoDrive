@@ -20,7 +20,93 @@ import {
 import { CenterId, TransportRoute, TransportStop } from '../types/transportation';
 import { TRANSPORT_CENTERS, TRANSPORT_ROUTES } from '../data/transportationData';
 
+import { useAdminAuth } from '../context/AdminAuthContext';
+
+type TransportRow = Record<string, string | number | null>;
+type TransportSnapshot = Record<string, TransportRow[]>;
+function TransportationManager({onClose}:{onClose:()=>void}) {
+  const auth = useAdminAuth();
+  const [center,setCenter]=useState<CenterId>('al_quoz');
+  const [snapshot,setSnapshot]=useState<TransportSnapshot|null>(null);
+  const [revision,setRevision]=useState('');
+  const [backups,setBackups]=useState<{id:string;created_at:string;source_filename:string|null}[]>([]);
+  const [error,setError]=useState('');
+  const [busy,setBusy]=useState(false);
+  const [dirty,setDirty]=useState(false);
+  const [routeId,setRouteId]=useState('');
+  const [review,setReview]=useState(false);
+  const [original,setOriginal]=useState<TransportSnapshot|null>(null);
+  const base='/api/transport/admin/'+center;
+  const field='w-full min-w-24 rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-2 py-1.5 text-xs';
+  const button='rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-2 text-xs font-semibold disabled:opacity-50';
+  const primary=button+' bg-[#064E3B] text-white';
+  async function request(url:string,token:string,method='GET',body?:unknown) {
+    const res=await fetch(url,{method,headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),cache:'no-store'});
+    const data=await res.json();
+    if(!res.ok) throw new Error(data.error || 'Request failed');
+    return data;
+  }
+  async function load(token:string) {
+    setBusy(true);setError('');
+    try {
+      const [catalog,history]=await Promise.all([request(base,token),request(base+'/backups',token)]);
+      setSnapshot(catalog.snapshot);setOriginal(catalog.snapshot);setRevision(catalog.revision);setBackups(history.backups);
+      setRouteId(catalog.snapshot.transport_routes[0]?.id || '');setDirty(false);setReview(false);
+    } catch(e){setError(String(e instanceof Error?e.message:e));}
+    finally{setBusy(false);}
+  }
+  useEffect(()=>{setSnapshot(null);setOriginal(null);setBackups([]);setDirty(false);setReview(false);const token=auth.getValidToken();if(token)void load(token);},[center,auth.isAuthorized]);
+  const update=(table:string,idx:number,key:string,value:TransportRow[string])=>{
+    setSnapshot(old=>old?{...old,[table]:old[table].map((r,i)=>i===idx?{...r,[key]:value}:r)}:old);setDirty(true);setReview(false);
+  };
+  const change=(fn:(draft:TransportSnapshot)=>void)=>{setSnapshot(old=>{if(!old)return old;const draft=structuredClone(old);fn(draft);return draft;});setDirty(true);setReview(false);};
+  const uid=()=>crypto.randomUUID();
+  const addRoute=()=>{const id=uid();change(d=>{d.transport_routes.push({id,center_id:center,route_code:'NEW ROUTE',title:'New route',schedule_type:'FULL WEEK SCHEDULE',capacity:24,center_eta_name:center==='dic'?'ECO DRIVE - DIC':'ECO DRIVE AL QUOZ',active:1});});setRouteId(id);};
+  const addStop=()=>change(d=>{const id=uid();d.transport_stops.push({id,route_id:routeId,name:'New stop',landmark:'',pin_url:null,latitude:null,longitude:null,position:d.transport_stops.filter(r=>r.route_id===routeId).length,active:1});for(const t of d.transport_trips.filter(r=>r.route_id===routeId))d.transport_stop_times.push({route_id:routeId,trip_id:t.id,stop_id:id,pickup_time:''});});
+  const addTrip=()=>change(d=>{const id=uid();d.transport_trips.push({id,route_id:routeId,position:d.transport_trips.filter(r=>r.route_id===routeId).length,eta:null,departure:null,notes:null,active:1});for(const s of d.transport_stops.filter(r=>r.route_id===routeId))d.transport_stop_times.push({route_id:routeId,trip_id:id,stop_id:s.id,pickup_time:''});});
+  const remove=(table:string,row:TransportRow)=>change(d=>{
+    d[table]=d[table].filter(r=>r.id!==row.id);
+    if(table==='transport_routes')for(const key of Object.keys(d).filter(k=>k!==table))d[key]=d[key].filter(r=>r.route_id!==row.id);
+    if(table==='transport_stops')d.transport_stop_times=d.transport_stop_times.filter(r=>r.stop_id!==row.id);
+    if(table==='transport_trips')d.transport_stop_times=d.transport_stop_times.filter(r=>r.trip_id!==row.id);
+  });
+  const publish=(backupId?:string)=>auth.requireAdminAuthorization(backupId?'Restore transportation backup':'Publish transportation schedule',async token=>{
+    setBusy(true);setError('');
+    try{await request(base+(backupId?'/restore':''),token,backupId?'POST':'PUT',backupId?{revision,backupId}:{revision,snapshot});window.location.reload();}
+    catch(e){setError(e instanceof Error?e.message:String(e));setBusy(false);}
+  });
+  const route=snapshot?.transport_routes.find(r=>r.id===routeId);
+  const rows=(table:string)=>snapshot?.[table].map((row,index)=>({row,index})).filter(x=>x.row.route_id===routeId)||[];
+  const edit=(table:string,index:number,row:TransportRow,key:string,numeric=false)=><label key={key} className="text-xs space-y-1"><span>{key.replaceAll('_',' ')}</span><input className={field} type={numeric?'number':'text'} value={row[key]??''} onChange={e=>update(table,index,key,numeric?(e.target.value===''?null:Number(e.target.value)):(e.target.value===''&&row[key]===null?null:e.target.value))}/></label>;
+  return <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0F172A] p-4 space-y-4">
+    <div className="flex justify-between items-center"><h2 className="font-bold text-lg">Transportation Manager</h2><button className={button} disabled={busy} onClick={()=>{if(!dirty||window.confirm('Discard unsaved changes?'))onClose();}}>Close</button></div>
+    {!auth.isAuthorized?<button className={primary} onClick={()=>auth.requireAdminAuthorization('Transportation Manager',()=>{})}>Unlock</button>:<>
+    <div className="flex gap-2 flex-wrap">{(['al_quoz','dic'] as CenterId[]).map(c=><button key={c} disabled={busy} className={c===center?primary:button} onClick={()=>{if(c!==center&&(!dirty||window.confirm('Discard unsaved changes?')))setCenter(c);}}>{c==='dic'?'DIC Centre':'Al Quoz Centre'}</button>)}</div>
+    {error&&<p role="alert" className="text-sm text-red-600">{error}</p>}
+    {busy&&<p role="status" className="text-sm">Loading…</p>}
+    {!snapshot&&!busy&&<button className={button} onClick={()=>auth.requireAdminAuthorization('Load schedules',load)}>Retry</button>}
+    {snapshot&&<fieldset disabled={busy} className="space-y-4">
+      <div className="flex gap-2 flex-wrap"><select aria-label="Route" className={field+' max-w-md'} value={routeId} onChange={e=>setRouteId(e.target.value)}><option value="">Select route</option>{snapshot.transport_routes.map(r=><option key={String(r.id)} value={String(r.id)}>{r.route_code} — {r.title}</option>)}</select><button className={button} onClick={addRoute}>+ Route</button></div>
+      {route&&<>
+      <div className="grid grid-cols-2 md:grid-cols-3 gap-2">{['route_code','title','schedule_type','capacity','center_eta_name'].map(k=>edit('transport_routes',snapshot.transport_routes.indexOf(route),route,k,k==='capacity'))}<button className={button+' text-red-600'} onClick={()=>{if(window.confirm('Remove this route and all its stops and trips?')){remove('transport_routes',route);setRouteId('');}}}>Remove route</button></div>
+      <div className="flex justify-between items-center"><h3 className="font-bold">Stops</h3><button className={button} onClick={addStop}>+ Stop</button></div>
+      {rows('transport_stops').map(({row,index})=><div key={String(row.id)} className="grid grid-cols-2 md:grid-cols-4 gap-2 border-t border-slate-200 dark:border-slate-800 pt-2">{['name','landmark','pin_url','latitude','longitude','position'].map(k=>edit('transport_stops',index,row,k,['latitude','longitude','position'].includes(k)))}<button className={button+' text-red-600'} onClick={()=>remove('transport_stops',row)}>Remove stop</button></div>)}
+      <div className="flex justify-between items-center"><h3 className="font-bold">Trips & pickup times</h3><button className={button} onClick={addTrip}>+ Trip</button></div>
+      {rows('transport_trips').map(({row,index})=><div key={String(row.id)} className="grid grid-cols-2 md:grid-cols-4 gap-2 border-t border-slate-200 dark:border-slate-800 pt-2">{['eta','departure','notes','position'].map(k=>edit('transport_trips',index,row,k,k==='position'))}{rows('transport_stop_times').filter(x=>x.row.trip_id===row.id).map(x=><label key={String(x.row.stop_id)} className="text-xs">{snapshot.transport_stops.find(s=>s.id===x.row.stop_id)?.name}<input className={field} placeholder="7:30AM" value={x.row.pickup_time??''} onChange={e=>update('transport_stop_times',x.index,'pickup_time',e.target.value)}/></label>)}<button className={button+' text-red-600'} onClick={()=>remove('transport_trips',row)}>Remove trip</button></div>)}
+      <div className="flex justify-between items-center"><h3 className="font-bold">Centre departures</h3><button className={button} onClick={()=>change(d=>d.transport_departures.push({id:uid(),route_id:routeId,departure_time:'',destination:null,notes:null,position:d.transport_departures.filter(r=>r.route_id===routeId).length,active:1}))}>+ Departure</button></div>
+      {rows('transport_departures').map(({row,index})=><div key={String(row.id)} className="grid grid-cols-2 md:grid-cols-4 gap-2">{['departure_time','destination','notes','position'].map(k=>edit('transport_departures',index,row,k,k==='position'))}<button className={button+' text-red-600'} onClick={()=>remove('transport_departures',row)}>Remove departure</button></div>)}
+      </>}
+      <div className="flex gap-2"><button className={primary} disabled={!dirty} onClick={()=>setReview(true)}>Review changes</button></div>
+      {review&&<div className="border rounded-xl p-3 space-y-2"><h3 className="font-bold">Review before publish</h3>{Object.keys(snapshot).map(k=>{const before=original?.[k]||[];const after=snapshot[k];return <p key={k} className="text-xs">{k.replace('transport_','').replaceAll('_',' ')}: {before.length} → {after.length} rows; {after.filter(r=>!before.some(b=>JSON.stringify(b)===JSON.stringify(r))).length} new or changed</p>;})}<button className={primary} onClick={()=>publish()}>Publish</button></div>}
+      <h3 className="font-bold">Backups</h3>{backups.length===0&&<p className="text-xs">No backups yet.</p>}{backups.map(b=><div key={b.id} className="flex justify-between items-center gap-2 text-xs"><span>{b.created_at} {b.source_filename||''}</span><button className={button} onClick={()=>{if(window.confirm('Restore this backup? Current published data will be backed up; unsaved edits will be discarded.'))publish(b.id);}}>Restore</button></div>)}
+    </fieldset>}
+    </>}
+  </section>;
+}
+
 export const TransportationPage: React.FC = () => {
+  const [managerOpen,setManagerOpen]=useState(false);
+  const adminAuth=useAdminAuth();
   // Selected Center (default: Al Quoz)
   const [selectedCenterId, setSelectedCenterId] = useState<CenterId>('al_quoz');
 
@@ -153,6 +239,8 @@ export const TransportationPage: React.FC = () => {
 
   return (
     <div className="space-y-6">
+      <div className="flex justify-end print:hidden"><button className="rounded-xl bg-[#064E3B] text-white px-4 py-2 text-xs font-bold" onClick={()=>adminAuth.requireAdminAuthorization('Transportation Manager',()=>setManagerOpen(true))}>Manage Transportation</button></div>
+      {managerOpen&&<TransportationManager onClose={()=>setManagerOpen(false)}/>}
       {/* 1. Center Selection Tabs (Al Quoz Centre vs Dubai Industrial City Centre) */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {TRANSPORT_CENTERS.map((center) => {
