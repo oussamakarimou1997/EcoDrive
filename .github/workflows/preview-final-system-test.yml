@@ -1,0 +1,73 @@
+name: Preview Final System Testing
+on:
+  workflow_dispatch:
+  push:
+    branches: [maplibre-migration]
+permissions:
+  contents: read
+jobs:
+  test:
+    if: github.ref == 'refs/heads/maplibre-migration'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install
+      - run: bun run lint
+      - run: bun run build
+      - name: Preview API regression checks
+        env:
+          PREVIEW_URL: https://maplibre-migration-ecodrive.karimououssama91.workers.dev
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          const base = process.env.PREVIEW_URL;
+          async function request(path, status=200, method='GET', token) {
+            const headers = token ? {Authorization:'Bearer '+token} : {};
+            const r = await fetch(base+path,{method,headers,redirect:'error',signal:AbortSignal.timeout(20000)});
+            assert.equal(r.status,status,method+' '+path);
+            console.log('PASS',method,path,status);
+            return r;
+          }
+          await request('/');
+          const catalog = await (await request('/api/transport/catalog')).json();
+          assert.equal(catalog.centers.length,2);
+          const time = /^(?:0?[1-9]|1[0-2]):[0-5][0-9][AP]M$/i;
+          const ids = new Set();
+          for (const [center,count] of [['dic',10],['al_quoz',4]]) {
+            const routes = catalog.routes.filter(r=>r.centerId===center);
+            assert.equal(routes.length,count);
+            const filtered = await (await request('/api/transport/catalog?center='+center)).json();
+            assert.deepEqual(filtered.routes,routes);
+            for(const r of routes){
+              assert(!ids.has(r.id)); ids.add(r.id);
+              assert(r.stops.length && r.trips.length && r.departures.length);
+              const stops = new Set(r.stops.map(s=>s.id));
+              assert.equal(stops.size,r.stops.length);
+              for(const t of r.trips){
+                for(const [id,value] of Object.entries(t.stopTimes)){
+                  assert(stops.has(id),r.id+' unknown stop');
+                  assert(time.test(value),r.id+' invalid pickup '+value);
+                }
+              }
+              for(const d of r.departures) assert(time.test(d.time),r.id+' invalid return '+d.time);
+            }
+            await request('/api/transport/admin/'+center,401);
+            await request('/api/transport/admin/'+center+'/backups',401);
+            await request('/api/transport/admin/'+center,401,'PUT');
+            await request('/api/transport/admin/'+center+'/restore',401,'POST');
+            await request('/api/transport/admin/'+center,401,'GET','invalid-test-token');
+          }
+          await request('/api/transport/catalog?center=invalid',400);
+          const status = await (await request('/api/admin/status')).json();
+          assert.equal(status.configured,true);
+          assert.equal(status.managedByEnv,true);
+          assert.equal(status.authorized,false);
+          await request('/api/admin/setup',403,'POST');
+          await request('/api/admin/change-code',403,'POST');
+          console.log('PASS catalog integrity and anonymous access restrictions');
+          JS

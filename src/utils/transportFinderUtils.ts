@@ -1,3 +1,4 @@
+import { getTripReturnDepartures, formatReturnDeparture } from '../types/transportation';
 import { TRANSPORT_CENTERS, TRANSPORT_ROUTES } from '../data/transportationData';
 import { CenterId } from '../types/transportation';
 import {
@@ -280,7 +281,9 @@ export function buildStationsFromSource(
     const centerName = centerLookup[route.centerId];
 
     for (const stop of route.stops) {
-      const coords = stop.pinUrl ? resolvedPins[stop.pinUrl] ?? null : null;
+      const coords = typeof stop.latitude === 'number' && typeof stop.longitude === 'number' && Number.isFinite(stop.latitude) && Number.isFinite(stop.longitude) && stop.latitude >= 22.5 && stop.latitude <= 26.5 && stop.longitude >= 51 && stop.longitude <= 56.5
+        ? { lat: stop.latitude, lng: stop.longitude }
+        : stop.pinUrl ? resolvedPins[stop.pinUrl] ?? null : null;
       const groupKey = normalizeStationGroupKey(branchCode, stop.name, stop.landmark, coords);
 
       if (!stationMap[groupKey]) {
@@ -351,8 +354,8 @@ export function buildStationsFromSource(
           minutesFromMidnight: mins,
           period: getTimePeriod(mins),
           etaAtCentre: trip.eta,
-          returnDeparture: trip.departure,
-          notes: trip.notes,
+          returnDeparture: route.departures ? (getTripReturnDepartures(route, trip).map(formatReturnDeparture).join(' / ') || '—') : trip.departure,
+          notes: route.departures ? undefined : trip.notes,
         });
       }
     }

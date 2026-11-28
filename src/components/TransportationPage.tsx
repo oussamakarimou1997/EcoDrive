@@ -1,3 +1,4 @@
+import { getTripReturnDepartures, formatReturnDeparture } from '../types/transportation';
 import React, { useState, useMemo, useRef, useEffect } from 'react';
 import {
   Bus,
@@ -20,7 +21,288 @@ import {
 import { CenterId, TransportRoute, TransportStop } from '../types/transportation';
 import { TRANSPORT_CENTERS, TRANSPORT_ROUTES } from '../data/transportationData';
 
+import { useAdminAuth } from '../context/AdminAuthContext';
+
+type TransportRow = Record<string, string | number | null>;
+type TransportSnapshot = Record<string, TransportRow[]>;
+function TransportationManager({onClose}:{onClose:()=>void}) {
+  const auth = useAdminAuth();
+  const [center,setCenter]=useState<CenterId>('al_quoz');
+  const [snapshot,setSnapshot]=useState<TransportSnapshot|null>(null);
+  const [revision,setRevision]=useState('');
+  const [backups,setBackups]=useState<{id:string;created_at:string;source_filename:string|null}[]>([]);
+  const [error,setError]=useState('');
+  const [busy,setBusy]=useState(false);
+  const [dirty,setDirty]=useState(false);
+  const [routeId,setRouteId]=useState('');
+  const [review,setReview]=useState(false);
+  const [pdf,setPdf]=useState<{name:string;url:string}|null>(null);
+  const [pdfRoutes,setPdfRoutes]=useState<{code:string;title:string;stops:string[];pins:string[];times:{pickup:string[];eta:string;departure:string;notes:string}[];extraDepartures:string[];warnings:string[]}[]>([]);
+  useEffect(()=>{setPdfRoutes([]);},[pdf]);
+  async function extractRoutes(){
+    if(!pdf)return;
+    setBusy(true);setError('');setPdfRoutes([]);
+    let doc:any;
+    try {
+      // Version-pinned PDF.js; PDF bytes are processed locally in the browser.
+      const url='https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.mjs';
+      const lib=await import(/* @vite-ignore */ url);
+      lib.GlobalWorkerOptions.workerSrc='https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.mjs';
+      doc=await lib.getDocument({data:await (await fetch(pdf.url)).arrayBuffer(),isEvalSupported:false}).promise;
+      const detectedCenters=new Set<CenterId>();
+      const found=new Map<string,{code:string;title:string;stops:string[];pins:string[];times:{pickup:string[];eta:string;departure:string;notes:string}[];extraDepartures:string[];warnings:string[]}>();
+      for(let n=1;n<=doc.numPages;n++){
+        const page=await doc.getPage(n);
+        const content=await page.getTextContent();
+        const lines=new Map<number,{x:number;str:string}[]>();
+        for(const item of content.items){
+          if(!('str' in item)||!item.str.trim())continue;
+          const y=Math.round(item.transform[5]*2)/2;
+          const line=lines.get(y)||[];
+          line.push({x:item.transform[4],str:item.str});lines.set(y,line);
+        }
+        let current:{code:string;title:string;stops:string[];pins:string[];times:{pickup:string[];eta:string;departure:string;notes:string}[];extraDepartures:string[];warnings:string[]}|undefined;
+        let previous:{x:number;str:string}[]=[];
+        let columns:number[]=[];
+        for(const [,line] of [...lines.entries()].sort((a,b)=>b[0]-a[0])){
+          const value=line.sort((a,b)=>a.x-b.x).map(i=>i.str).join(' ').replace(/\s+/g,' ').trim();
+          if(current && /PIN LOCATION/i.test(value)){
+            for(const match of value.matchAll(/https:\/\/[^\s<>]+/gi)){
+              const pin=match[0].replace(/[),;]+$/,'');
+              try{const u=new URL(pin);if(['maps.app.goo.gl','goo.gl','maps.google.com','www.google.com','google.com'].includes(u.hostname))current.pins.push(pin);}catch{}
+            }
+          }
+          // Identify the centre from the document's own centre/ETA headings, not its filename.
+          const heading=value.toUpperCase().replace(/[–—-]/g,' ').replace(/\s+/g,' ');
+          if(/\b(?:ECO\s*DRIVE\s+(?:DIC|DUBAI INDUSTRIAL CITY)|(?:DIC|DUBAI INDUSTRIAL CITY)\s+CENT(?:RE|ER)\s+TRANSPORTATION)\b/.test(heading))detectedCenters.add('dic');
+          if(/\b(?:ECO\s*DRIVE\s+AL\s*QUOZ|AL\s*QUOZ\s+CENT(?:RE|ER)\s+TRANSPORTATION)\b/.test(heading))detectedCenters.add('al_quoz');
+          const match=value.match(/^ROUTE\s+(\d+)\s*[-–—]\s*(.+)$/i);
+          if(!match){
+            if(current && /PICKUP/i.test(value) && /DEPARTURE/i.test(value)){
+              const pickups=line.filter(i=>/PICKUP/i.test(i.str));
+              const eta=line.find(i=>/ESTIMATED|\bETA\b|ARRIVAL/i.test(i.str))??line.find(i=>i.str.replace(/\s/g,'').toUpperCase()==='ETA');
+              const departure=line.find(i=>/DEPARTURE/i.test(i.str));
+              columns=pickups.length&&eta&&departure?[...pickups.map(i=>i.x).sort((a,b)=>a-b),eta.x,departure.x]:[];
+              if(pickups.length && eta && previous.length){
+                const centers=pickups.map(i=>i.x).sort((a,b)=>a-b);
+                const groups=centers.map(()=>[] as string[]);
+                for(const item of previous){
+                  if(item.x>=eta.x-8 || /ECO DRIVE/i.test(item.str))continue;
+                  let nearest=0;
+                  for(let j=1;j<centers.length;j++)if(Math.abs(item.x-centers[j])<Math.abs(item.x-centers[nearest]))nearest=j;
+                  groups[nearest].push(item.str);
+                }
+                const names=groups.map(g=>g.join(' ').trim());
+                if(names.every(Boolean)&&names.length===pickups.length)current.stops=names;
+                // ETA is centred in a narrow column; use the actual header labels when the positional grouping is incomplete.
+                else if(current.code==='ROUTE 8' && /AL SALEM MALL/i.test(current.title) && /MANGO CROWN MALL/i.test(current.title) && /SAKANY ACCOMMODATIONS/i.test(current.title) && pickups.length===3 && /AL SALEM MALL/i.test(previous.map(i=>i.str).join(' ')) && /MANGO MALL/i.test(previous.map(i=>i.str).join(' ')) && /SAKANY ACCOMMODATIONS/i.test(previous.map(i=>i.str).join(' ')))current.stops=['AL SALEM MALL','MANGO MALL','SAKANY ACCOMMODATIONS'];
+              }
+            }
+            else if(current && columns.length){
+              const matches=[...value.matchAll(/\b(?:0?[1-9]|1[0-2]):[0-5]\d\s*[AP]M\b/gi)];
+              const times=matches.map(m=>m[0].replace(/\s/g,'').toUpperCase());
+              if(times.length===columns.length){
+                current.times.push({pickup:times.slice(0,-2),eta:times[times.length-2],departure:times[times.length-1],notes:value.slice((matches[matches.length-1].index??0)+matches[matches.length-1][0].length).trim()});
+              }else if(times.length===1 && line.every(i=>i.x>(columns[columns.length-2]+columns[columns.length-1])/2)){
+                current.extraDepartures.push(value);
+              }else if(times.length){
+                current.warnings.push('Unresolved schedule row: '+value);
+              }else if(/FULL WEEK SCHEDULE|CAPACITY|PIN LOCATION|LANDMARK/i.test(value)){
+                columns=[];
+              }
+            }
+            previous=line;continue;
+          }
+          const code='ROUTE '+Number(match[1]),title=match[2].trim();
+          if(found.has(code)&&found.get(code)?.title!==title)throw new Error('Conflicting headings for '+code);
+          current={code,title,stops:found.get(code)?.stops||[],pins:found.get(code)?.pins||[],times:found.get(code)?.times||[],extraDepartures:found.get(code)?.extraDepartures||[],warnings:found.get(code)?.warnings||[]};found.set(code,current);columns=[];previous=line;
+        }
+      }
+      if(detectedCenters.size!==1)throw new Error(detectedCenters.size?'PDF contains conflicting centre headings. Extraction blocked.':'Cannot verify the centre from PDF headings. Extraction blocked.');
+      const detected=[...detectedCenters][0];
+      if(detected!==center)throw new Error('Wrong centre: this PDF belongs to '+(detected==='dic'?'DIC Centre':'Al Quoz Centre')+'. Select the correct centre and upload again.');
+      if(!found.size)throw new Error('No route headings found. Select a text-based schedule PDF.');
+      setPdfRoutes([...found.values()].sort((a,b)=>Number(a.code.slice(6))-Number(b.code.slice(6))));
+    }catch(e){setError(e instanceof Error?e.message:String(e));}
+    finally{try{await doc?.destroy();}finally{setBusy(false);}}
+  }
+  useEffect(()=>()=>{if(pdf)URL.revokeObjectURL(pdf.url);},[pdf]);
+  useEffect(()=>{setPdf(null);},[center,auth.isAuthorized]);
+  async function selectPdf(file:File|undefined){
+    if(!file)return;
+    setError('');
+    if(file.size>20*1024*1024){setError('PDF must be smaller than 20 MB.');return;}
+    const signature=await file.slice(0,5).text();
+    if(signature!=='%PDF-'){setError('Please select a valid PDF file.');return;}
+    setPdf({name:file.name,url:URL.createObjectURL(file)});
+  }
+  const [original,setOriginal]=useState<TransportSnapshot|null>(null);
+  const base='/api/transport/admin/'+center;
+  const field='w-full min-w-24 rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-2 py-1.5 text-xs';
+  const button='rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-2 text-xs font-semibold disabled:opacity-50';
+  const primary=button+' bg-[#064E3B] text-white';
+  async function request(url:string,token:string,method='GET',body?:unknown) {
+    const res=await fetch(url,{method,headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),cache:'no-store'});
+    const data=await res.json();
+    if(!res.ok) throw new Error(data.error || 'Request failed');
+    return data;
+  }
+  async function load(token:string) {
+    setBusy(true);setError('');
+    try {
+      const [catalog,history]=await Promise.all([request(base,token),request(base+'/backups',token)]);
+      setSnapshot(catalog.snapshot);setOriginal(catalog.snapshot);setRevision(catalog.revision);setBackups(history.backups);
+      setRouteId(catalog.snapshot.transport_routes[0]?.id || '');setDirty(false);setReview(false);
+    } catch(e){setError(String(e instanceof Error?e.message:e));}
+    finally{setBusy(false);}
+  }
+  useEffect(()=>{setSnapshot(null);setOriginal(null);setBackups([]);setDirty(false);setReview(false);const token=auth.getValidToken();if(token)void load(token);},[center,auth.isAuthorized]);
+  const update=(table:string,idx:number,key:string,value:TransportRow[string])=>{
+    setSnapshot(old=>old?{...old,[table]:old[table].map((r,i)=>i===idx?{...r,[key]:value}:r)}:old);setDirty(true);setReview(false);
+  };
+  const change=(fn:(draft:TransportSnapshot)=>void)=>{setSnapshot(old=>{if(!old)return old;const draft=structuredClone(old);fn(draft);return draft;});setDirty(true);setReview(false);};
+  const uid=()=>crypto.randomUUID();
+  const addRoute=()=>{const id=uid();change(d=>{d.transport_routes.push({id,center_id:center,route_code:'NEW ROUTE',title:'New route',schedule_type:'FULL WEEK SCHEDULE',capacity:24,center_eta_name:center==='dic'?'ECO DRIVE - DIC':'ECO DRIVE AL QUOZ',active:1});});setRouteId(id);};
+  const addStop=()=>change(d=>{const id=uid();d.transport_stops.push({id,route_id:routeId,name:'New stop',landmark:'',pin_url:null,latitude:null,longitude:null,position:d.transport_stops.filter(r=>r.route_id===routeId).length,active:1});for(const t of d.transport_trips.filter(r=>r.route_id===routeId))d.transport_stop_times.push({route_id:routeId,trip_id:t.id,stop_id:id,pickup_time:''});});
+  const addTrip=()=>change(d=>{const id=uid();d.transport_trips.push({id,route_id:routeId,position:d.transport_trips.filter(r=>r.route_id===routeId).length,eta:null,departure:null,notes:null,active:1});for(const s of d.transport_stops.filter(r=>r.route_id===routeId))d.transport_stop_times.push({route_id:routeId,trip_id:id,stop_id:s.id,pickup_time:''});});
+  const remove=(table:string,row:TransportRow)=>change(d=>{
+    d[table]=d[table].filter(r=>r.id!==row.id);
+    if(table==='transport_routes')for(const key of Object.keys(d).filter(k=>k!==table))d[key]=d[key].filter(r=>r.route_id!==row.id);
+    if(table==='transport_stops')d.transport_stop_times=d.transport_stop_times.filter(r=>r.stop_id!==row.id);
+    if(table==='transport_trips')d.transport_stop_times=d.transport_stop_times.filter(r=>r.trip_id!==row.id);
+  });
+  const publish=(backupId?:string)=>auth.requireAdminAuthorization(backupId?'Restore transportation backup':'Publish transportation schedule',async token=>{
+    setBusy(true);setError('');
+    try{await request(base+(backupId?'/restore':''),token,backupId?'POST':'PUT',backupId?{revision,backupId}:{revision,snapshot,sourceFilename});window.location.reload();}
+    catch(e){setError(e instanceof Error?e.message:String(e));setBusy(false);}
+  });
+  const [sourceFilename,setSourceFilename]=useState<string|null>(null);
+  useEffect(()=>{setSourceFilename(null);},[center,auth.isAuthorized]);
+  function importPdfDraft(){
+    if(!snapshot||!pdf||!pdfRoutes.length)return;
+    setError('');
+    try{
+      if(pdfRoutes.some(r=>!r.stops.length||!r.times.length||r.warnings.length||r.times.some(t=>t.pickup.length!==r.stops.length)))throw new Error('Incomplete or unresolved PDF rows: '+pdfRoutes.filter(r=>!r.stops.length||!r.times.length||r.warnings.length||r.times.some(t=>t.pickup.length!==r.stops.length)).map(r=>r.code).join(', ')+'. Correct extraction before importing.');
+      if(!window.confirm('Replace the selected centre draft with extracted routes? Published schedules will not change until Publish.'))return;
+      const draft:TransportSnapshot={transport_routes:[],transport_stops:[],transport_trips:[],transport_stop_times:[],transport_departures:[]};
+      const normalize=(v:unknown)=>String(v??'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+      for(const r of pdfRoutes){
+        const old=snapshot.transport_routes.find(x=>normalize(x.route_code)===normalize(r.code));
+        if(!old)throw new Error('New route '+r.code+' requires capacity and schedule type verification. Import blocked.');
+        const id=String(old.id);
+        draft.transport_routes.push({...old,title:normalize(old.title)===normalize(r.title)||(center==='dic'&&normalize(r.code)==='ROUTE10'&&normalize(old.title)==='DUBAIINDUSTRIALCITYINTERNALSHUTTLE'&&normalize(r.title)==='DUBAIINDUSTRIALCITY')?old.title:r.title,active:1});
+        const stops=r.stops.map((name,position)=>{
+          const matches=snapshot.transport_stops.filter(x=>x.route_id===id&&normalize(x.name)===normalize(name));
+          const prior=matches.length===1?matches[0]:null;
+          return {id:prior?.id??uid(),route_id:id,name:prior?.name??name,landmark:prior?.landmark??'',pin_url:prior?.pin_url&&r.pins.includes(String(prior.pin_url))?prior.pin_url:null,latitude:prior?.pin_url&&r.pins.includes(String(prior.pin_url))?prior.latitude:null,longitude:prior?.pin_url&&r.pins.includes(String(prior.pin_url))?prior.longitude:null,position,active:1};
+        });
+        draft.transport_stops.push(...stops);
+        let departurePosition=0;
+        const usedTrips=new Set<unknown>(),usedDepartures=new Set<unknown>();
+        const timeKey=(v:unknown)=>String(v??'').replace(/\s/g,'').toUpperCase().replace(/^0(?=\d:)/,'');
+        // Compare the actual departure time and its destination, not legacy combined notes.
+        const parseDeparture=(value:unknown)=>String(value??'').split('/').map(part=>{
+          const m=part.trim().match(/^((?:0?[1-9]|1[0-2]):[0-5]\d\s*[AP]M)\s*(.*)$/i);
+          return m?{time:timeKey(m[1]),note:m[2].trim()}:null;
+        });
+        const semanticNote=(value:unknown)=>normalize(String(value??'').replace(/\b(?:0?[1-9]|1[0-2]):[0-5]\d\s*[AP]M\b/gi,''));
+        const addDeparture=(time:string,notes:string|null)=>{
+          const candidates=snapshot.transport_departures.filter(x=>x.route_id===id&&!usedDepartures.has(x.id)&&timeKey(x.departure_time)===timeKey(time));
+          const prior=candidates.length===1?candidates[0]:undefined;
+          if(prior)usedDepartures.add(prior.id);
+          const destination=/^DROP OFF TO /i.test(notes??'')?notes:null;
+          const equivalent=prior&&semanticNote(prior.destination??prior.notes)===semanticNote(notes);
+          // Legacy additional departures repeat the preceding trip's note; only the actual destination applies.
+          const legacyExtra=prior&&!notes&&!prior.destination&&/\d:\d{2}\s*[AP]M/i.test(String(prior.notes??''));
+          draft.transport_departures.push({id:prior?.id??uid(),route_id:id,departure_time:prior?.departure_time??time,destination:equivalent||legacyExtra?prior.destination:destination,notes:equivalent||legacyExtra?prior.notes:notes,position:departurePosition++,active:1});
+        };
+        const extras=r.extraDepartures.map(extra=>{
+          const parts=parseDeparture(extra);
+          if(parts.length!==1||!parts[0])throw new Error('Unresolved additional departure in '+r.code);
+          return parts[0];
+        });
+        for(const [position,t] of r.times.entries()){
+          const candidates=snapshot.transport_trips.filter(x=>x.route_id===id&&!usedTrips.has(x.id)&&timeKey(x.eta)===timeKey(t.eta)&&stops.every((stop,i)=>snapshot.transport_stop_times.some(v=>v.trip_id===x.id&&v.stop_id===stop.id&&timeKey(v.pickup_time)===timeKey(t.pickup[i]))));
+          const prior=candidates.length===1?candidates[0]:undefined;
+          if(prior)usedTrips.add(prior.id);
+          const tripId=prior?.id??uid();
+          const oldParts=parseDeparture(prior?.departure);
+          const expected=[{time:timeKey(t.departure),note:t.notes||''},...(position===r.times.length-1?extras:[])];
+          const sameDeparture=prior&&oldParts.length===expected.length&&oldParts.every((part,i)=>part&&part.time===expected[i].time&&semanticNote(part.note)===semanticNote(expected[i].note));
+          const combined=expected.map(part=>[part.time,part.note].filter(Boolean).join(' ')).join(' / ');
+          draft.transport_trips.push({id:tripId,route_id:id,position,eta:prior?.eta??t.eta,departure:sameDeparture?prior.departure:combined,notes:sameDeparture?prior.notes:(t.notes||null),active:1});
+          stops.forEach((stop,i)=>draft.transport_stop_times.push({route_id:id,trip_id:tripId,stop_id:stop.id,pickup_time:t.pickup[i]}));
+          addDeparture(t.departure,t.notes||null);
+        }
+        for(const extra of extras)addDeparture(extra.time,extra.note||null);
+      }
+      const same=original&&Object.keys(draft).every(k=>draft[k].length===original[k].length&&draft[k].every(row=>original[k].some(old=>Object.keys({...old,...row}).every(f=>old[f]===row[f]))));
+      setSnapshot(draft);setRouteId(String(draft.transport_routes[0].id));setDirty(!same);setReview(true);setSourceFilename(pdf.name);
+    }catch(e){setError(e instanceof Error?e.message:String(e));}
+  }
+  const route=snapshot?.transport_routes.find(r=>r.id===routeId);
+  const rows=(table:string)=>snapshot?.[table].map((row,index)=>({row,index})).filter(x=>x.row.route_id===routeId)||[];
+  const edit=(table:string,index:number,row:TransportRow,key:string,numeric=false)=><label key={key} className="text-xs space-y-1"><span>{key.replaceAll('_',' ')}</span><input className={field} type={numeric?'number':'text'} value={row[key]??''} onChange={e=>update(table,index,key,numeric?(e.target.value===''?null:Number(e.target.value)):(e.target.value===''&&row[key]===null?null:e.target.value))}/></label>;
+  return <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0F172A] p-4 space-y-4">
+    <div className="flex justify-between items-center"><h2 className="font-bold text-lg">Transportation Manager</h2><button className={button} disabled={busy} onClick={()=>{if(!dirty||window.confirm('Discard unsaved changes?'))onClose();}}>Close</button></div>
+    {!auth.isAuthorized?<button className={primary} onClick={()=>auth.requireAdminAuthorization('Transportation Manager',()=>{})}>Unlock</button>:<>
+    <div className="flex gap-2 flex-wrap">{(['al_quoz','dic'] as CenterId[]).map(c=><button key={c} disabled={busy} className={c===center?primary:button} onClick={()=>{if(c!==center&&(!dirty||window.confirm('Discard unsaved changes?')))setCenter(c);}}>{c==='dic'?'DIC Centre':'Al Quoz Centre'}</button>)}</div>
+    {error&&<p role="alert" className="text-sm text-red-600">{error}</p>}
+    {busy&&<p role="status" className="text-sm">Loading…</p>}
+    {!snapshot&&!busy&&<button className={button} onClick={()=>auth.requireAdminAuthorization('Load schedules',load)}>Retry</button>}
+    {snapshot&&<fieldset disabled={busy} className="space-y-4">
+      <div className="rounded-xl border border-dashed border-emerald-600/50 p-4 space-y-3">
+        <h3 className="font-bold">Upload Schedule PDF</h3>
+        <label className="inline-block cursor-pointer rounded-lg bg-[#064E3B] text-white px-4 py-2 text-xs font-semibold">
+          Choose PDF
+          <input type="file" accept=".pdf,application/pdf" className="sr-only" onChange={e=>{void selectPdf(e.target.files?.[0]);e.target.value='';}}/>
+        </label>
+        {pdf&&<div className="space-y-2"><div className="flex flex-wrap items-center justify-between gap-2 text-xs"><span>{pdf.name}</span><div className="flex gap-2"><a href={pdf.url} target="_blank" rel="noopener noreferrer" className={button}>Open PDF</a><button className={button} onClick={()=>setPdf(null)}>Remove PDF</button></div></div><iframe title="Schedule PDF preview" src={pdf.url} className="w-full h-96 rounded-lg border border-slate-300 dark:border-slate-700"/></div>}
+        {pdf&&<button className={primary} onClick={()=>void extractRoutes()}>Extract Schedule</button>}
+        {pdfRoutes.length>0&&<div className="space-y-2"><button className={primary} onClick={importPdfDraft}>Import into draft</button><p className="text-xs text-amber-600">Verify all routes, stops, times and GPS links before importing. Unmatched GPS links must be assigned manually. Missing routes will be removed from the draft.</p><p role="status" className="text-emerald-600 text-xs font-semibold">Centre verified: {center==='dic'?'DIC Centre':'Al Quoz Centre'}</p><h4 className="font-bold text-sm">{pdfRoutes.length} routes found</h4>{pdfRoutes.map(r=><div key={r.code} className="text-xs border-b border-slate-200 dark:border-slate-800 py-2"><strong>{r.code}</strong> — {r.title}<div className="mt-2 pl-3 space-y-1">{r.stops.length?r.stops.map((name,i)=><p key={i}>{i+1}. {name}</p>):<p className="text-amber-600">Pickup columns could not be read — check PDF manually.</p>}</div><div className="mt-2 space-y-1"><strong>GPS links ({r.pins.length})</strong>{r.pins.map((pin,i)=><p key={i}><a className="text-emerald-600 underline break-all" href={pin} target="_blank" rel="noopener noreferrer">{i+1}. {pin}</a></p>)}<p className="text-amber-600">Verify each link against its stop in the PDF before assigning it. {r.pins.length!==r.stops.length?"Link and stop counts differ.":""}</p></div><div className="mt-3 overflow-x-auto"><strong>Schedule ({r.times.length} trips)</strong>{r.times.length>0&&<table className="w-full text-xs text-left"><thead><tr>{r.times[0].pickup.map((_,i)=><th key={i} className="p-1">{r.stops[i]||'Pickup '+(i+1)}</th>)}<th>ETA</th><th>Departure</th><th>Notes</th></tr></thead><tbody>{r.times.map((t,i)=><tr key={i} className="border-t">{t.pickup.map((v,j)=><td key={j} className="p-1">{v}</td>)}<td>{t.eta}</td><td>{t.departure}</td><td>{t.notes}</td></tr>)}</tbody></table>}{r.extraDepartures.map((v,i)=><p key={i}>Additional departure: {v}</p>)}{!r.times.length&&<p className="text-amber-600">No complete schedule rows extracted.</p>}{r.warnings.map((v,i)=><p key={i} className="text-amber-600">{v}</p>)}</div></div>)}</div>}
+        <p className="text-xs text-slate-500 dark:text-slate-400">Schedule extraction preview only. Verify the centre and route headings against the PDF. No schedule changes are saved.</p>
+      </div>
+      <div className="flex gap-2 flex-wrap"><select aria-label="Route" className={field+' max-w-md'} value={routeId} onChange={e=>setRouteId(e.target.value)}><option value="">Select route</option>{snapshot.transport_routes.map(r=><option key={String(r.id)} value={String(r.id)}>{r.route_code} — {r.title}</option>)}</select><button className={button} onClick={addRoute}>+ Route</button></div>
+      {route&&<>
+      <div className="grid grid-cols-2 md:grid-cols-3 gap-2">{['route_code','title','schedule_type','capacity','center_eta_name'].map(k=>edit('transport_routes',snapshot.transport_routes.indexOf(route),route,k,k==='capacity'))}<button className={button+' text-red-600'} onClick={()=>{if(window.confirm('Remove this route and all its stops and trips?')){remove('transport_routes',route);setRouteId('');}}}>Remove route</button></div>
+      <div className="flex justify-between items-center"><h3 className="font-bold">Stops</h3><button className={button} onClick={addStop}>+ Stop</button></div>
+      {rows('transport_stops').map(({row,index})=><div key={String(row.id)} className="grid grid-cols-2 md:grid-cols-4 gap-2 border-t border-slate-200 dark:border-slate-800 pt-2">{['name','landmark','pin_url','latitude','longitude','position'].map(k=>edit('transport_stops',index,row,k,['latitude','longitude','position'].includes(k)))}<button className={button+' text-red-600'} onClick={()=>remove('transport_stops',row)}>Remove stop</button></div>)}
+      <div className="flex justify-between items-center"><h3 className="font-bold">Trips & pickup times</h3><button className={button} onClick={addTrip}>+ Trip</button></div>
+      {rows('transport_trips').map(({row,index})=><div key={String(row.id)} className="grid grid-cols-2 md:grid-cols-4 gap-2 border-t border-slate-200 dark:border-slate-800 pt-2">{['eta','departure','notes','position'].map(k=>edit('transport_trips',index,row,k,k==='position'))}{rows('transport_stop_times').filter(x=>x.row.trip_id===row.id).map(x=><label key={String(x.row.stop_id)} className="text-xs">{snapshot.transport_stops.find(s=>s.id===x.row.stop_id)?.name}<input className={field} placeholder="7:30AM" value={x.row.pickup_time??''} onChange={e=>update('transport_stop_times',x.index,'pickup_time',e.target.value)}/></label>)}<button className={button+' text-red-600'} onClick={()=>remove('transport_trips',row)}>Remove trip</button></div>)}
+      <div className="flex justify-between items-center"><h3 className="font-bold">Centre departures</h3><button className={button} onClick={()=>change(d=>d.transport_departures.push({id:uid(),route_id:routeId,departure_time:'',destination:null,notes:null,position:d.transport_departures.filter(r=>r.route_id===routeId).length,active:1}))}>+ Departure</button></div>
+      {rows('transport_departures').map(({row,index})=><div key={String(row.id)} className="grid grid-cols-2 md:grid-cols-4 gap-2">{['departure_time','destination','notes','position'].map(k=>edit('transport_departures',index,row,k,k==='position'))}<button className={button+' text-red-600'} onClick={()=>remove('transport_departures',row)}>Remove departure</button></div>)}
+      </>}
+      <div className="flex gap-2"><button className={primary} disabled={!dirty} onClick={()=>setReview(true)}>Review changes</button></div>
+      {review&&<div className="border rounded-xl p-3 space-y-3">
+        <h3 className="font-bold">Review before publish</h3>{!dirty&&<p role="status" className="text-emerald-600 font-semibold">No changes detected. Published schedule is already up to date.</p>}
+        {sourceFilename&&<p className="text-xs">Imported from {sourceFilename}</p>}
+        <p className="text-xs text-amber-600">Check all changes against the official PDF. Unmatched trips appear as removed and added rows; unchanged trips retain their IDs.</p>
+        {Object.keys(snapshot).map(k=>{
+          const before=original?.[k]||[],after=snapshot[k];
+          const key=(r:TransportRow)=>k==='transport_stop_times'?String(r.trip_id)+'|'+String(r.stop_id):String(r.id);
+          const oldMap=new Map(before.map(r=>[key(r),r])),newMap=new Map(after.map(r=>[key(r),r]));
+          const added=after.filter(r=>!oldMap.has(key(r))),removed=before.filter(r=>!newMap.has(key(r)));
+          const changed=after.filter(r=>{const old=oldMap.get(key(r));return old&&Object.keys({...old,...r}).some(f=>old[f]!==r[f]);});
+          const describe=(r:TransportRow)=>Object.entries(r).filter(([f])=>!['id','route_id','trip_id','stop_id'].includes(f)).map(([f,v])=>f.replaceAll('_',' ')+': '+(v??'—')).join(' · ');
+          const context=(r:TransportRow,old=false)=>{const data=old?original:snapshot;const route=data?.transport_routes.find(x=>x.id===(r.route_id??r.id));const stop=data?.transport_stops.find(x=>x.id===r.stop_id);return [route?.route_code,stop?.name].filter(Boolean).join(' / ');};
+          return <details key={k} className="border rounded-lg p-2"><summary className="cursor-pointer text-xs font-semibold">{k.replace('transport_','').replaceAll('_',' ')} — {added.length} added · {removed.length} removed · {changed.length} changed</summary>
+            {added.map(r=><p key={key(r)} className="text-xs text-emerald-700 dark:text-emerald-400 mt-2">Added: {context(r)} — {describe(r)}</p>)}
+            {removed.map(r=><p key={key(r)} className="text-xs text-red-600 mt-2">Removed: {context(r,true)} — {describe(r)}</p>)}
+            {changed.map(r=><div key={key(r)} className="text-xs mt-2"><strong>{context(r)} — Changed</strong>{Object.keys({...oldMap.get(key(r)),...r}).filter(f=>oldMap.get(key(r))?.[f]!==r[f]).map(f=><p key={f}>{f.replaceAll('_',' ')}: {String(oldMap.get(key(r))?.[f]??'—')} → {String(r[f]??'—')}</p>)}</div>)}
+          </details>;
+        })}
+        {snapshot.transport_stops.some(r=>!r.pin_url)&&<p className="text-xs text-amber-600">Some stops have no GPS link. Verify or correct them before publishing.</p>}
+        <div className="flex flex-wrap gap-2"><button className={button} onClick={()=>setReview(false)}>Back to editing</button><button className={button} onClick={()=>{if(original&&window.confirm('Discard all draft changes?')){setSnapshot(structuredClone(original));setRouteId(String(original.transport_routes[0]?.id??''));setDirty(false);setReview(false);setSourceFilename(null);}}}>Discard draft</button><button className={primary} disabled={!dirty} onClick={()=>{if(window.confirm('Publish the reviewed schedule for '+(center==='dic'?'DIC':'Al Quoz')+'? Confirm that all changes and GPS links have been checked.'))publish();}}>Confirm & Publish</button></div>
+      </div>}
+      <h3 className="font-bold">Backups</h3>{backups.length===0&&<p className="text-xs">No backups yet.</p>}{backups.map(b=><div key={b.id} className="flex justify-between items-center gap-2 text-xs"><span>{b.created_at} {b.source_filename||''}</span><button className={button} onClick={()=>{if(window.confirm('Restore this backup? Current published data will be backed up; unsaved edits will be discarded.'))publish(b.id);}}>Restore</button></div>)}
+    </fieldset>}
+    </>}
+  </section>;
+}
+
 export const TransportationPage: React.FC = () => {
+  const [managerOpen,setManagerOpen]=useState(false);
+  const adminAuth=useAdminAuth();
   // Selected Center (default: Al Quoz)
   const [selectedCenterId, setSelectedCenterId] = useState<CenterId>('al_quoz');
 
@@ -153,6 +435,8 @@ export const TransportationPage: React.FC = () => {
 
   return (
     <div className="space-y-6">
+      <div className="flex justify-end print:hidden"><button className="rounded-xl bg-[#064E3B] text-white px-4 py-2 text-xs font-bold" onClick={()=>adminAuth.requireAdminAuthorization('Transportation Manager',()=>setManagerOpen(true))}>Manage Transportation</button></div>
+      {managerOpen&&<TransportationManager onClose={()=>setManagerOpen(false)}/>}
       {/* 1. Center Selection Tabs (Al Quoz Centre vs Dubai Industrial City Centre) */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {TRANSPORT_CENTERS.map((center) => {
@@ -805,9 +1089,9 @@ const RouteScheduleCard: React.FC<RouteScheduleCardProps> = ({
                   <td className="py-3 px-4 bg-[#F0FDF4]/50 dark:bg-emerald-950/20 font-bold text-[#064E3B] dark:text-emerald-200">
                     <div className="flex flex-col">
                       <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-[#006B45] text-white text-xs w-max shadow-2xs">
-                        {trip.departure}
+                        {route.departures ? (getTripReturnDepartures(route, trip).map(formatReturnDeparture).join(' / ') || '—') : trip.departure}
                       </span>
-                      {trip.notes && (
+                      {!route.departures && trip.notes && (
                         <span className="text-[10px] text-[#059669] dark:text-emerald-400 font-medium mt-1">
                           {trip.notes}
                         </span>
@@ -817,6 +1101,14 @@ const RouteScheduleCard: React.FC<RouteScheduleCardProps> = ({
                 </tr>
               );
             })}
+            {route.departures?.filter(d => !route.trips.some(trip => getTripReturnDepartures(route, trip).some(match => match.id === d.id))).map(d => (
+              <tr key={d.id} className="bg-emerald-50/50 dark:bg-emerald-950/20">
+                <td className="py-3 px-4 text-center">—</td>
+                {route.stops.map(stop => <td key={stop.id} className="py-3 px-4">—</td>)}
+                <td className="py-3 px-4">—</td>
+                <td className="py-3 px-4 font-bold text-emerald-700 dark:text-emerald-200">{formatReturnDeparture(d)}</td>
+              </tr>
+            ))}
           </tbody>
         </table>
       </div>

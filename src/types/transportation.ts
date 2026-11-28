@@ -15,6 +15,8 @@ export interface TransportStop {
   name: string;
   landmark: string;
   pinUrl?: string;
+  latitude?: number | null;
+  longitude?: number | null;
 }
 
 export interface TransportTrip {
@@ -35,4 +37,30 @@ export interface TransportRoute {
   stops: TransportStop[];
   centerEtaName: string; // e.g. "ECO DRIVE AL QUOZ" or "ECO DRIVE - DIC"
   trips: TransportTrip[];
+  departures?: { id: string; time: string; destination?: string | null; notes?: string | null }[];
+}
+
+/** Match official return departures by the times explicitly recorded on a pickup row.
+ * Unmatched departures remain independent; never infer a pairing from array position.
+ */
+export function getTripReturnDepartures(route: TransportRoute, trip: TransportTrip) {
+  const times = (trip.departure || '').toUpperCase().match(/\b\d{1,2}:\d{2}\s*[AP]M\b/g) || [];
+  // Only the first time belongs to the pickup row; subsequent times are independent.
+  const first = times[0]?.replace(/\s/g, '');
+  return (route.departures || []).filter(d => d.time.toUpperCase().replace(/\s/g, '') === first);
+}
+export function formatReturnDeparture(d: NonNullable<TransportRoute['departures']>[number]) {
+  // Legacy notes can repeat the entire evening departure list on each row.
+  // Keep explicit destinations; strip only time-only lists from display notes.
+  const note = (d.notes || '').trim().replace(/\s+/g, ' ');
+  const timeList = /^\d{1,2}:\d{2}\s*[AP]M(?:\s*(?:&|\/|,|AND)\s*\d{1,2}:\d{2}\s*[AP]M)*$/i;
+  const legacyExpo = /^(\d{1,2}:\d{2}\s*[AP]M)\s+DROP OFF TO EXPO METRO\s*&\s*\d{1,2}:\d{2}\s*[AP]M$/i.exec(note);
+  const normalized = (time: string) => time.toUpperCase().replace(/\s/g, '');
+  const displayNote = legacyExpo
+    ? (normalized(legacyExpo[1]) === normalized(d.time) ? 'DROP OFF TO EXPO METRO' : '')
+    : (timeList.test(note) ? '' : note);
+  const destination = (d.destination || '').trim().replace(/\s+/g, ' ');
+  const legacyDestination = /^\d{1,2}:\d{2}\s*[AP]M\s+DROP OFF TO EXPO METRO\s*&\s*\d{1,2}:\d{2}\s*[AP]M$/i.test(destination);
+  const detail = (legacyDestination || timeList.test(destination) ? '' : destination) || displayNote;
+  return [d.time, detail].filter(Boolean).join(' · ');
 }

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { APIProvider, useMapsLibrary } from '@vis.gl/react-google-maps';
+import {searchDubaiAddress, reverseDubaiAddress} from '../services/openMapGeocoding';
 import {
   Sparkles,
   MapPin,
@@ -24,6 +24,7 @@ import {
   Lock,
   GitBranch,
 } from 'lucide-react';
+import { getTripReturnDepartures, formatReturnDeparture } from '../types/transportation';
 import { TRANSPORT_ROUTES } from '../data/transportationData';
 import {
   AIRecommendationResponse,
@@ -62,15 +63,9 @@ const DEFAULT_FILTERS: SmartTransportFilters = {
   maxDistanceKm: null,
 };
 
-const DUBAI_QUICK_BOUNDS: google.maps.LatLngBoundsLiteral = {
-  north: 25.45,
-  south: 24.75,
-  east: 55.65,
-  west: 54.85,
-};
 
 const AISmartTransportFinderContent: React.FC = () => {
-  const placesLib = useMapsLibrary('places');
+
 
   // 1. Source-of-truth resolved pin coordinates from Express backend
   const [pinsData, setPinsData] = useState<ResolvedPinsResponse>({
@@ -161,6 +156,10 @@ const AISmartTransportFinderContent: React.FC = () => {
   const [aiRefreshNonce, setAiRefreshNonce] = useState(0);
   const [aiData, setAiData] = useState<AIRecommendationResponse | null>(null);
   const [aiLoading, setAiLoading] = useState(false);
+  const [aiEnhanced, setAiEnhanced] = useState(false);
+  const aiCooldownUntil = useRef(0);
+  const aiCache = useRef(new Map<string, { expiresAt: number; insights: string[] }>());
+  const [aiCacheHit, setAiCacheHit] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
 
   const step2SectionRef = useRef<HTMLElement>(null);
@@ -283,6 +282,12 @@ const AISmartTransportFinderContent: React.FC = () => {
     return getSameRouteStations(primaryResult.station, selectedBranch, allStations);
   }, [primaryResult, selectedBranch, allStations]);
 
+  const additionalReturnDepartures = TRANSPORT_ROUTES
+    .filter(route => selectedBranch && route.centerId === BRANCH_META[selectedBranch].centerId && sameRouteLines.some(line => line.routeId === route.id))
+    .flatMap(route => (route.departures || [])
+      .filter(departure => !route.trips.some(trip => getTripReturnDepartures(route, trip).some(match => match.id === departure.id)))
+      .map(departure => ({ key: route.id + ':' + departure.id, routeCode: route.routeCode, label: formatReturnDeparture(departure) })));
+
   // Next 3 closest optional nearby alternative stops belonging ONLY to selectedBranch
   const otherNearbyResults = useMemo(() => {
     if (!primaryResult) return [];
@@ -315,68 +320,10 @@ const AISmartTransportFinderContent: React.FC = () => {
   };
 
   // Resolve free-text area query only when user didn't already pick a suggestion or exact station
-  const resolveAreaTextToLocation = useCallback(
-    async (rawQuery: string): Promise<StudentLocation | null> => {
-      const trimmed = rawQuery.trim();
-      if (!trimmed) return null;
-
-      try {
-        const resp = await fetch(`/api/maps/geocode?address=${encodeURIComponent(trimmed)}`);
-        const data = (await resp.json()) as {
-          quotaExceeded?: boolean;
-          result?: { lat: number; lng: number; formattedAddress: string } | null;
-        };
-        if (resp.status === 429 || data.quotaExceeded) {
-          window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
-        }
-        if (resp.ok && data.result) {
-          return {
-            lat: data.result.lat,
-            lng: data.result.lng,
-            label: data.result.formattedAddress,
-            areaName: trimmed,
-            source: 'autocomplete',
-          };
-        }
-      } catch {
-        // Fall through to Google Places client SDK
-      }
-
-      if (placesLib?.Place?.searchByText) {
-        try {
-          const { places } = await placesLib.Place.searchByText({
-            textQuery: trimmed.toLowerCase().includes('dubai') ? trimmed : `${trimmed}, Dubai, UAE`,
-            fields: ['displayName', 'formattedAddress', 'location'],
-            locationBias: DUBAI_QUICK_BOUNDS,
-            region: 'AE',
-            maxResultCount: 1,
-          });
-          const found = places?.[0];
-          if (found?.location) {
-            return {
-              lat: found.location.lat(),
-              lng: found.location.lng(),
-              label: found.formattedAddress || found.displayName || trimmed,
-              areaName: found.displayName || trimmed,
-              source: 'autocomplete',
-            };
-          }
-        } catch (placesErr: unknown) {
-          const msg = String(placesErr instanceof Error ? placesErr.message : placesErr || '');
-          if (
-            msg.includes('RESOURCE_EXHAUSTED') ||
-            msg.includes('OVER_QUERY_LIMIT') ||
-            msg.includes('429')
-          ) {
-            window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
-          }
-        }
-      }
-
-      return null;
-    },
-    [placesLib]
-  );
+  const resolveAreaTextToLocation = useCallback(async (rawQuery: string): Promise<StudentLocation | null> => {
+    try { return (await searchDubaiAddress(rawQuery))[0] ?? null; }
+    catch { return null; }
+  }, []);
 
   // Direct Official Station selection (strictly preserves selected station)
   const handleSelectDirectOfficialStation = useCallback(
@@ -571,17 +518,8 @@ const AISmartTransportFinderContent: React.FC = () => {
         let areaName = 'Current Location';
 
         try {
-          const resp = await fetch(`/api/maps/reverse-geocode?lat=${lat}&lng=${lng}`);
-          const data = (await resp.json()) as {
-            quotaExceeded?: boolean;
-            formattedAddress?: string;
-            areaName?: string;
-          };
-          if (resp.status === 429 || data.quotaExceeded) {
-            window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
-          }
-          if (data.formattedAddress) label = data.formattedAddress;
-          if (data.areaName) areaName = data.areaName;
+          const result = await reverseDubaiAddress(lat,lng,'geolocation');
+          label = result.label; areaName = result.areaName || areaName;
         } catch {
           // Keep coordinate label if reverse geocode fails
         }
@@ -718,42 +656,108 @@ const AISmartTransportFinderContent: React.FC = () => {
         unmappedStationsCount: unmappedStations.length,
       };
 
+      // Deterministic guidance from the same branch-scoped search result as the schedule.
+      // Available immediately, even if Gemini or the network is unavailable.
+      const station = payload.nearestStation;
+      const recommendations: string[] = [];
+      const headline = !station
+        ? 'No verified pickup station matches the current filters.'
+        : payload.matchStatus === 'exact_station'
+          ? 'Selected official pickup station: ' + station.name + '.'
+          : 'No exact official station selected for this location. Optional nearby pickup: ' + station.name + '.';
+      if (station) {
+        recommendations.push('Destination: ' + branchMeta.title + '.');
+        if (station.landmarks.length) recommendations.push('Pickup landmark: ' + station.landmarks.join('; ') + '.');
+        if (station.straightLineKm !== null) recommendations.push('Straight-line distance: ' + station.straightLineKm + ' km.');
+        recommendations.push(station.walkingDistanceMeters !== null
+          ? 'Walking distance: ' + station.walkingDistanceMeters + ' m' + (station.walkingDurationMinutes !== null ? '; estimated walking time: ' + station.walkingDurationMinutes + ' min.' : '.')
+          : 'Walking route data is unavailable.');
+        if (station.nextBus) {
+          const bus = station.nextBus;
+          recommendations.push('Next pickup: ' + bus.departureTime + ' (' + bus.routeCode + ')' + (bus.isNextDay ? ' — ' + bus.nextDayLabel : '') + '.');
+        } else {
+          recommendations.push('No next pickup is available under the current filters. Check the schedule or adjust filters.');
+        }
+        // Live feasibility is computed locally, never inferred by Gemini.
+        if (station.nextBus && !station.nextBus.isNextDay && station.walkingDurationMinutes !== null) {
+          const remaining = station.nextBus.minutesRemaining;
+          const required = station.walkingDurationMinutes + 10;
+          if (Number.isFinite(remaining)) {
+            recommendations.push(remaining >= required
+              ? 'Allow ' + required + ' minutes for walking and a 10-minute boarding buffer before pickup.'
+              : 'The next pickup may be too soon for the estimated walk and boarding buffer. Check the following scheduled pickup.');
+          }
+        }
+        if (station.departures.length) recommendations.push('Scheduled pickups: ' + station.departures.map(d => d.time).join(', ') + '.');
+      } else {
+        recommendations.push('Try adjusting the distance or time filters within the selected branch.');
+      }
+      const alternative = payload.nearbyAlternatives[0];
+      const local: AIRecommendationResponse = {
+        headline,
+        recommendations,
+        alternativeTip: alternative ? 'Optional nearby alternative: ' + alternative.name + ' (' + alternative.straightLineKm + ' km straight-line).' : 'No additional nearby alternative matches the current filters.',
+        arrivalReminder: 'Arrive 5–10 minutes before pickup. ' + (station?.hasCoordinates ? 'Use Open in Google Maps to verify the pickup point.' : 'Verify the pickup location before travelling.'),
+      };
+      if (!controller.signal.aborted) {
+        setAiData(local);
+        setAiError(null);
+        setAiLoading(false);
+      }
+      setAiEnhanced(false);
+      setAiCacheHit(false);
+      if (!station || !station.departures.length || controller.signal.aborted) return;
+      // Exact context key includes schedule, branch, location, filters and current bus.
+      // Omit countdown and clock from AI input: local guidance owns live timing.
+      const aiPayload = { ...payload, dubaiTime: { weekday: payload.dubaiTime.weekday }, nearestStation: { ...station, nextBus: station.nextBus ? { ...station.nextBus, minutesRemaining: undefined } : null } };
+      const cacheKey = 'advice-v2:' + JSON.stringify(aiPayload);
+      const now = Date.now();
+      for (const [key, entry] of aiCache.current) if (entry.expiresAt <= now) aiCache.current.delete(key);
+      const cached = aiCache.current.get(cacheKey);
+      if (cached) {
+        setAiData({ ...local, recommendations: [...local.recommendations, ...cached.insights] });
+        setAiEnhanced(true);
+        setAiCacheHit(true);
+        return;
+      }
+      if (now < aiCooldownUntil.current) return;
+      // Keep verified local guidance visible; AI is optional and never replaces schedule facts.
+      const timeout = window.setTimeout(() => { aiCooldownUntil.current = Date.now() + 60000; controller.abort(); }, 8000);
       fetch('/api/transport/ai-recommendations', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(aiPayload),
         signal: controller.signal,
-      })
-        .then(async (resp) => {
-          const rawText = await resp.text();
-          let data: Record<string, unknown> = {};
-          try {
-            data = rawText ? (JSON.parse(rawText) as Record<string, unknown>) : {};
-          } catch {
-            if (!resp.ok) {
-              throw new Error(`AI service returned HTTP ${resp.status}. Please try again.`);
-            }
-            throw new Error('Invalid response received from AI recommendation service.');
-          }
-          if (!resp.ok) {
-            throw new Error(
-              typeof data.error === 'string' && data.error
-                ? data.error
-                : 'Unable to generate AI recommendations.'
-            );
-          }
-          setAiData(data as unknown as AIRecommendationResponse);
-        })
-        .catch((err: unknown) => {
-          if (err instanceof DOMException && err.name === 'AbortError') return;
-          setAiData(null);
-          setAiError(
-            err instanceof Error ? err.message : 'AI recommendation service is currently unavailable.'
-          );
-        })
-        .finally(() => {
-          if (!controller.signal.aborted) setAiLoading(false);
-        });
+      }).then(async (response) => {
+        if (!response.ok) {
+          aiCooldownUntil.current = Date.now() + (response.status === 429 ? 300000 : 60000);
+          return;
+        }
+        const data = await response.json() as Partial<AIRecommendationResponse>;
+        if (controller.signal.aborted) return;
+        if (typeof data.headline !== 'string' || !data.headline.trim() ||
+            !Array.isArray(data.recommendations) || !data.recommendations.length ||
+            !data.recommendations.every(v => typeof v === 'string' && v.trim()) ||
+            typeof data.alternativeTip !== 'string' || typeof data.arrivalReminder !== 'string') return;
+        // Keep official facts intact and display AI wording separately.
+        const normalize = (v: string) => v.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+        const existing = new Set(local.recommendations.map(normalize));
+        const insights = data.recommendations.map(v => v.trim()).filter(v => {
+          const key = normalize(v);
+          if (!key || existing.has(key) || v.split(/\s+/).length > 25 ||
+              /\d|straight.line distance|walking distance|scheduled pickups|pickup landmark|next pickup is|next available bus/i.test(v)) return false;
+          existing.add(key);
+          return true;
+        }).slice(0, 2).map(v => 'AI insight: ' + v);
+        if (!insights.length) return;
+        if (aiCache.current.size >= 32) { const oldest = aiCache.current.keys().next().value; if (oldest !== undefined) aiCache.current.delete(oldest); }
+        aiCache.current.set(cacheKey, { expiresAt: Date.now() + 300000, insights });
+        setAiData({ ...local, recommendations: [...local.recommendations, ...insights] });
+        setAiEnhanced(true);
+      }).catch(() => {
+        if (!controller.signal.aborted) aiCooldownUntil.current = Date.now() + 60000;
+      }).finally(() => window.clearTimeout(timeout));
+
     }, 250);
 
     return () => {
@@ -1327,7 +1331,7 @@ const AISmartTransportFinderContent: React.FC = () => {
                         </span>
                         <span className="block text-[10px] text-[#006B45]/80 dark:text-emerald-400/80">
                           {walkingRouteInfo.status === 'available'
-                            ? 'Google Routes walking path'
+                            ? 'OpenRouteService walking path'
                             : walkingRouteInfo.reason || 'Straight-line used'}
                         </span>
                       </div>
@@ -1544,10 +1548,10 @@ const AISmartTransportFinderContent: React.FC = () => {
                 </div>
                 <div>
                   <h3 className="text-sm sm:text-base font-extrabold text-[#064E3B] dark:text-emerald-200">
-                    AI Transportation Assistant ({selectedBranchMeta.shortName})
+                    Local Smart Assistant ({selectedBranchMeta.shortName})
                   </h3>
                   <p className="text-[11px] text-[#006B45] dark:text-emerald-400">
-                    Verified guidance strictly for {selectedBranchMeta.title} stations and schedules
+                    Schedule-based guidance for {selectedBranchMeta.title} · {aiEnhanced ? (aiCacheHit ? 'AI-enhanced · Cached' : 'AI-enhanced') : 'Local guidance'}
                   </p>
                 </div>
               </div>
@@ -1566,7 +1570,7 @@ const AISmartTransportFinderContent: React.FC = () => {
                   ) : (
                     <RotateCcw className="w-3.5 h-3.5" />
                   )}
-                  <span>{aiLoading ? 'Analyzing...' : 'Refresh AI'}</span>
+                  <span>{aiLoading ? 'Analyzing...' : 'Refresh guidance'}</span>
                 </button>
               </div>
             </div>
@@ -1629,7 +1633,7 @@ const AISmartTransportFinderContent: React.FC = () => {
               </div>
             ) : (
               <div className="bg-white/80 dark:bg-slate-900/70 border border-[#D1FAE5] dark:border-emerald-800/50 rounded-xl p-3.5 text-xs text-[#475569] dark:text-slate-300 flex items-center justify-between gap-3">
-                <span>Click &ldquo;Refresh AI&rdquo; to generate personalized transportation guidance for your selected stop.</span>
+                <span>Click Refresh guidance to update transportation guidance for your selected stop.</span>
               </div>
             )}
           </section>
@@ -1813,6 +1817,19 @@ const AISmartTransportFinderContent: React.FC = () => {
                   })}
                 </tbody>
               </table>
+            </div>
+          )}
+          {additionalReturnDepartures.length > 0 && (
+            <div className="p-4 sm:p-5 border-t border-[#E2E8F0] dark:border-slate-800 space-y-2">
+              <h4 className="text-sm font-bold text-[#0F172A] dark:text-slate-100">Additional Return Departures from Eco Drive</h4>
+              <p className="text-xs text-[#64748B] dark:text-slate-400">Return buses leaving the selected training centre, not pickup times.</p>
+              <div className="flex flex-wrap gap-2">
+                {additionalReturnDepartures.map(departure => (
+                  <span key={departure.key} className="rounded-lg px-3 py-1.5 text-xs font-bold bg-[#F0FDF4] dark:bg-emerald-950/60 text-[#006B45] dark:text-emerald-300">
+                    {departure.routeCode} · {departure.label}
+                  </span>
+                ))}
+              </div>
             </div>
           )}
         </section>
@@ -2082,16 +2099,4 @@ const AISmartTransportFinderContent: React.FC = () => {
   );
 };
 
-export const AISmartTransportFinderPage: React.FC = () => {
-  const mapsApiKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY || '';
-  return (
-    <APIProvider
-      apiKey={mapsApiKey}
-      language="en"
-      region="AE"
-      libraries={['places', 'marker', 'routes']}
-    >
-      <AISmartTransportFinderContent />
-    </APIProvider>
-  );
-};
+export const AISmartTransportFinderPage: React.FC = () => <AISmartTransportFinderContent />;
